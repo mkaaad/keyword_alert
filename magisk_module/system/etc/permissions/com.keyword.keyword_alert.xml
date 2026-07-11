@@ -5,6 +5,7 @@
         <permission name="android.permission.RECORD_AUDIO"/>
         <permission name="android.permission.FOREGROUND_SERVICE"/>
         <permission name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+        <permission name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
         <permission name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
         <permission name="android.permission.POST_NOTIFICATIONS"/>
         <permission name="android.permission.WAKE_LOCK"/>

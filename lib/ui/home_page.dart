@@ -135,12 +135,12 @@ class _HomePageState extends State<HomePage> {
           builder: (ctx) => AlertDialog(
             title: const Text('启动失败'),
             content: const Text(
-              '音频捕获启动失败，请检查 Magisk 模块是否安装并授予 Root 权限。\n\n'
-              '可能原因：\n'
-              '1. 未授予 Root 权限\n'
-              '2. REMOTE_SUBMIX 未注入\n'
-              '3. 设备不支持系统音频捕获\n'
-              '4. ASR 模型未正确打包',
+              '音频捕获启动失败。\n\n'
+              '请允许「屏幕录制/投射」权限（用于捕获 B站/会议等系统播放声音）。\n\n'
+              '其它可能原因：\n'
+              '1. 未授予 Root（可选，用于权限授权）\n'
+              '2. 未授予录音/通知权限\n'
+              '3. ASR 模型未正确打包',
             ),
             actions: [
               FilledButton(
