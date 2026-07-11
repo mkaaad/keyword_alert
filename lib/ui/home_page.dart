@@ -127,22 +127,10 @@ class _HomePageState extends State<HomePage> {
 
     setState(() => _isStarting = true);
 
-    // Android 14+: keep-alive FGS should be up before / while capturing.
-    try {
-      await FlutterForegroundTask.startService(
-        notificationTitle: '关键词监控运行中',
-        notificationText: '正在监听「${_config.keyword}」',
-        callback: backgroundTaskCallback,
-      );
-    } catch (e) {
-      debugPrint('startService failed: $e');
-    }
-
+    // Capture first (native starts mediaProjection FGS only AFTER user consents).
+    // Do not start Flutter FGS with mediaProjection type before consent — crashes on API 34.
     final ok = await _audioCapture.start();
     if (!ok) {
-      try {
-        await FlutterForegroundTask.stopService();
-      } catch (_) {}
       if (mounted) {
         setState(() => _isStarting = false);
         await showDialog<void>(
@@ -188,6 +176,16 @@ class _HomePageState extends State<HomePage> {
         }
       },
     );
+
+    try {
+      await FlutterForegroundTask.startService(
+        notificationTitle: '关键词监控运行中',
+        notificationText: '正在监听「${_config.keyword}」',
+        callback: backgroundTaskCallback,
+      );
+    } catch (e) {
+      debugPrint('startService failed: $e');
+    }
 
     if (!mounted) return;
     setState(() {

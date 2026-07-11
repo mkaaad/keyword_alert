@@ -36,7 +36,7 @@
             </intent-filter>
         </activity>
 
-        <!-- Must be running before MediaProjectionManager.getMediaProjection (API 34+) -->
+        <!-- Started only AFTER user accepts screen capture; then getMediaProjection inside -->
         <service
             android:name=".CaptureForegroundService"
             android:exported="false"
@@ -44,10 +44,10 @@
             android:stopWithTask="true"
             tools:ignore="ForegroundServicePermission" />
 
-        <!-- flutter_foreground_task: do not rename the service class -->
+        <!-- Keep-alive only — avoid mediaProjection type (crashes if started pre-consent) -->
         <service
             android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
-            android:foregroundServiceType="microphone|mediaProjection|specialUse"
+            android:foregroundServiceType="microphone|specialUse"
             android:exported="false"
             android:stopWithTask="true"
             tools:ignore="ForegroundServicePermission">

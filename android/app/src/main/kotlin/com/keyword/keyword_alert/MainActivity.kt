@@ -1,10 +1,10 @@
 package com.keyword.keyword_alert
 
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
+import android.content.IntentFilter
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
@@ -17,7 +17,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.Process
 import android.util.Log
-import android.view.Surface
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -28,8 +27,7 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val TAG = "KeywordAlert"
         private const val REQ_MEDIA_PROJECTION = 1001
-        /** Delay after starting FGS so startForeground has run before getMediaProjection. */
-        private const val FGS_READY_MS = 400L
+        private const val PROJECTION_WAIT_MS = 1500L
     }
 
     private var audioCapture: AudioCapture? = null
@@ -37,15 +35,41 @@ class MainActivity : FlutterActivity() {
     private var eventSink: EventChannel.EventSink? = null
 
     private var pendingStartResult: MethodChannel.Result? = null
-    private var mediaProjection: MediaProjection? = null
-    private var virtualDisplay: VirtualDisplay? = null
     private var projectionManager: MediaProjectionManager? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    private val projectionReadyReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != ACTION_PROJECTION_READY) return
+            val ok = intent.getBooleanExtra(EXTRA_OK, false)
+            Log.i(TAG, "PROJECTION_READY ok=$ok")
+            mainHandler.removeCallbacks(projectionTimeout)
+            continueAfterProjection(ok)
+        }
+    }
+
+    private val projectionTimeout = Runnable {
+        Log.w(TAG, "Projection ready timeout — try with whatever we have")
+        continueAfterProjection(CaptureForegroundService.ready)
+    }
+
+    private var waitingProjection = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         projectionManager =
             getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(
+                projectionReadyReceiver,
+                IntentFilter(ACTION_PROJECTION_READY),
+                Context.RECEIVER_NOT_EXPORTED,
+            )
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(projectionReadyReceiver, IntentFilter(ACTION_PROJECTION_READY))
+        }
 
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
@@ -85,24 +109,26 @@ class MainActivity : FlutterActivity() {
         })
     }
 
+    /**
+     * Do NOT start mediaProjection-type FGS before the user accepts the dialog —
+     * that crashes on Android 14 / ColorOS.
+     * Only open the system consent UI here.
+     */
     private fun requestCapturePermissionOrStart() {
-        // Android 14+: FGS type mediaProjection MUST be running before getMediaProjection.
-        CaptureForegroundService.start(this)
-        mainHandler.postDelayed({
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && projectionManager != null) {
-                try {
-                    val intent = projectionManager!!.createScreenCaptureIntent()
-                    startActivityForResult(intent, REQ_MEDIA_PROJECTION)
-                    return@postDelayed
-                } catch (e: Exception) {
-                    Log.w(TAG, "MediaProjection intent failed, fallback", e)
-                }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && projectionManager != null) {
+            try {
+                startActivityForResult(
+                    projectionManager!!.createScreenCaptureIntent(),
+                    REQ_MEDIA_PROJECTION,
+                )
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "MediaProjection intent failed, fallback", e)
             }
-            Thread {
-                val ok = startCaptureInternal(projection = null)
-                finishStart(ok)
-            }.start()
-        }, FGS_READY_MS)
+        }
+        Thread {
+            finishStart(startCaptureInternal(null))
+        }.start()
     }
 
     @Deprecated("Deprecated in Java")
@@ -110,49 +136,29 @@ class MainActivity : FlutterActivity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != REQ_MEDIA_PROJECTION) return
 
-        if (resultCode != Activity.RESULT_OK || data == null || projectionManager == null) {
+        if (resultCode != Activity.RESULT_OK || data == null) {
             Log.e(TAG, "MediaProjection denied by user")
             Thread {
-                val ok = startCaptureInternal(projection = null)
-                finishStart(ok)
+                finishStart(startCaptureInternal(null))
             }.start()
             return
         }
 
-        // Ensure FGS is still up (user may have spent time on the consent dialog).
-        CaptureForegroundService.start(this)
-        mainHandler.postDelayed({
-            try {
-                virtualDisplay?.release()
-            } catch (_: Exception) {
-            }
-            virtualDisplay = null
-            try {
-                mediaProjection?.stop()
-            } catch (_: Exception) {
-            }
-            try {
-                mediaProjection = projectionManager!!.getMediaProjection(resultCode, data)
-                Log.i(TAG, "getMediaProjection OK")
-                virtualDisplay = mediaProjection?.createVirtualDisplay(
-                    "keyword_alert_cap",
-                    2,
-                    2,
-                    1,
-                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                    null as Surface?,
-                    null,
-                    null,
-                )
-            } catch (e: Exception) {
-                Log.e(TAG, "getMediaProjection failed", e)
-                mediaProjection = null
-            }
-            Thread {
-                val ok = startCaptureInternal(projection = mediaProjection)
-                finishStart(ok)
-            }.start()
-        }, FGS_READY_MS)
+        // After consent: start FGS with mediaProjection type, then getMediaProjection inside service.
+        waitingProjection = true
+        CaptureForegroundService.startWithProjection(this, resultCode, data)
+        mainHandler.postDelayed(projectionTimeout, PROJECTION_WAIT_MS)
+    }
+
+    private fun continueAfterProjection(projectionOk: Boolean) {
+        if (!waitingProjection && pendingStartResult == null) return
+        waitingProjection = false
+        val projection: MediaProjection? =
+            if (projectionOk) CaptureForegroundService.currentProjection else null
+        Thread {
+            val ok = startCaptureInternal(projection)
+            finishStart(ok)
+        }.start()
     }
 
     private fun finishStart(ok: Boolean) {
@@ -163,7 +169,7 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun startCaptureInternal(projection: MediaProjection?): Boolean {
-        stopCaptureKeepProjection()
+        stopCaptureKeepService()
 
         Log.i(TAG, "Requesting root (optional for grants)...")
         if (execSu("id")) {
@@ -191,7 +197,7 @@ class MainActivity : FlutterActivity() {
         return true
     }
 
-    private fun stopCaptureKeepProjection() {
+    private fun stopCaptureKeepService() {
         asrStreamHandler?.stop()
         asrStreamHandler = null
         audioCapture?.stop()
@@ -199,17 +205,10 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun stopCapture() {
-        stopCaptureKeepProjection()
-        try {
-            virtualDisplay?.release()
-        } catch (_: Exception) {
-        }
-        virtualDisplay = null
-        try {
-            mediaProjection?.stop()
-        } catch (_: Exception) {
-        }
-        mediaProjection = null
+        waitingProjection = false
+        mainHandler.removeCallbacks(projectionTimeout)
+        stopCaptureKeepService()
+        CaptureForegroundService.clearProjection()
         CaptureForegroundService.stop(this)
     }
 
@@ -223,6 +222,10 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        try {
+            unregisterReceiver(projectionReadyReceiver)
+        } catch (_: Exception) {
+        }
         stopCapture()
         super.onDestroy()
     }
