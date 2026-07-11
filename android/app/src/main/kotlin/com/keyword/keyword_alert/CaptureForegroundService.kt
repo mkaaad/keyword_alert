@@ -45,6 +45,7 @@ class CaptureForegroundService : Service() {
 
         private var virtualDisplay: VirtualDisplay? = null
         private var imageReader: ImageReader? = null
+        private var projectionCallback: MediaProjection.Callback? = null
 
         fun startWithProjection(context: Context, resultCode: Int, data: Intent) {
             val intent = Intent(context, CaptureForegroundService::class.java).apply {
