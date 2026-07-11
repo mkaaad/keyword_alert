@@ -66,10 +66,16 @@ jobs:
           fi
           [ -n "${APK:-}" ] || { echo "No APK produced"; exit 1; }
 
-          mkdir -p build/app/outputs/flutter-apk
-          cp -f "$APK" build/app/outputs/flutter-apk/app-release.apk
-          ls -lh build/app/outputs/flutter-apk/app-release.apk
-          echo "APK_PATH=build/app/outputs/flutter-apk/app-release.apk" >> "$GITHUB_ENV"
+          # Normalize to the canonical Flutter APK path (skip if already there).
+          DEST=build/app/outputs/flutter-apk/app-release.apk
+          mkdir -p "$(dirname "$DEST")"
+          SRC_REAL=$(realpath "$APK")
+          DEST_REAL=$(realpath -m "$DEST")
+          if [ "$SRC_REAL" != "$DEST_REAL" ]; then
+            cp -f "$APK" "$DEST"
+          fi
+          ls -lh "$DEST"
+          echo "APK_PATH=$DEST" >> "$GITHUB_ENV"
 
       - name: Package Magisk module
         run: |
