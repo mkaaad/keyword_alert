@@ -45,7 +45,7 @@ jobs:
       - name: Build APK
         run: |
           set -euo pipefail
-          # arm64-only: smaller package; OnePlus Ace 3 is arm64-v8a
+          # arm64-only: smaller package
           flutter build apk --release --target-platform android-arm64
           APK=build/app/outputs/flutter-apk/app-release.apk
           if [ ! -f "$APK" ]; then
@@ -56,26 +56,48 @@ jobs:
           ls -lh "$APK"
           echo "APK_PATH=$APK" >> "$GITHUB_ENV"
 
-      - name: Package Magisk module
+      - name: Package dual artifacts (user APK + Magisk zip)
         run: |
           set -euo pipefail
-          # Extracts lib/arm64-v8a/*.so into priv-app/.../lib/arm64/ (required
-          # for system installs — PM does not extract APK native libs for Magisk).
-          bash scripts/package_magisk.sh "${APK_PATH:-build/app/outputs/flutter-apk/app-release.apk}"
+          APK="${APK_PATH:-build/app/outputs/flutter-apk/app-release.apk}"
+          [ -f "$APK" ] || { echo "APK not found: $APK"; exit 1; }
+
+          # 1) User / sideload APK (no Root; MediaProjection capture)
+          cp -f "$APK" keyword_alert-user.apk
+          ls -lh keyword_alert-user.apk
+
+          # 2) Magisk module (priv-app + pre-extracted arm64 libs)
+          bash scripts/package_magisk.sh "$APK"
           ls -lh keyword_alert_magisk.zip
+
+          echo "USER_APK=keyword_alert-user.apk" >> "$GITHUB_ENV"
+          echo "MAGISK_ZIP=keyword_alert_magisk.zip" >> "$GITHUB_ENV"
 
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: keyword_alert_magisk.zip
+          files: |
+            keyword_alert-user.apk
+            keyword_alert_magisk.zip
+          body: |
+            ## 两种安装方式（同一套构建）
+
+            | 文件 | 适用 | 说明 |
+            |------|------|------|
+            | `keyword_alert-user.apk` | 普通安装 | **无需 Root**。开始监控时允许「屏幕录制/投射」以捕获 B站/会议声音。 |
+            | `keyword_alert_magisk.zip` | Magisk 模块 | priv-app + 预解压 `lib/arm64`。可系统权限 / REMOTE 兜底；刷入后需重启。 |
+
+            模型已打进包内。arm64-v8a only。
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload Magisk zip (workflow_dispatch)
+      - name: Upload artifacts (workflow_dispatch)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: keyword_alert_magisk
-          path: keyword_alert_magisk.zip
+          name: keyword_alert-artifacts
+          path: |
+            keyword_alert-user.apk
+            keyword_alert_magisk.zip
