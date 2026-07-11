@@ -91,6 +91,25 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        // System default alarm ringtone (TYPE_ALARM / USAGE_ALARM).
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "com.keyword/alarm",
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "playSystemAlarm" -> {
+                    val ok = AlarmPlayer.play(this)
+                    result.success(ok)
+                }
+                "stopSystemAlarm" -> {
+                    AlarmPlayer.stop()
+                    result.success(true)
+                }
+                "isSystemAlarmPlaying" -> result.success(AlarmPlayer.isPlaying())
+                else -> result.notImplemented()
+            }
+        }
+
         EventChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "com.keyword/asr_stream"
@@ -234,6 +253,7 @@ class MainActivity : FlutterActivity() {
             unregisterReceiver(projectionReadyReceiver)
         } catch (_: Exception) {
         }
+        AlarmPlayer.stop()
         stopCapture()
         super.onDestroy()
     }
