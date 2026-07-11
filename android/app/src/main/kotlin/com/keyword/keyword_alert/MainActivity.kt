@@ -247,6 +247,8 @@ class AudioCapture {
     @Volatile var hasNewData = false
     @Volatile var lastRms: Double = 0.0
     @Volatile var totalFrames: Long = 0
+    /** playback | remote_submix | mic — for diagnostics */
+    @Volatile var captureMode: String = "none"
 
     fun start(projection: MediaProjection? = null): Boolean {
         if (isRunning.get()) return true
@@ -257,9 +259,15 @@ class AudioCapture {
         }
         val bufSize = maxOf(minBuf, SAMPLE_RATE * 2)
 
-        audioRecord = createPlaybackCaptureRecord(projection, bufSize)
-            ?: createRemoteSubmixRecord(bufSize)
-            ?: tryCreateFallbackRecord(bufSize)
+        captureMode = "none"
+        audioRecord = createPlaybackCaptureRecord(projection, bufSize)?.also {
+            captureMode = "playback"
+        } ?: createRemoteSubmixRecord(bufSize)?.also {
+            captureMode = "remote_submix"
+        } ?: tryCreateFallbackRecord(bufSize)?.also {
+            captureMode = "mic"
+        }
+        Log.i(TAG, "Capture mode selected: $captureMode projection=${projection != null}")
 
         if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
             Log.e(TAG, "AudioRecord not init, state=${audioRecord?.state}")

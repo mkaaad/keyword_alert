@@ -17,14 +17,24 @@ class AsrStreamHandler(
     companion object {
         private const val TAG = "KeywordAlert"
         private const val SAMPLE_RATE = 16000
-        /** ~3s of audio per decode chunk */
-        private const val CHUNK_MS = 3000L
+        /** ~2s of audio per decode chunk (faster feedback) */
+        private const val CHUNK_MS = 2000L
         /** Cap buffer to ~30s to avoid OOM when ASR falls behind */
         private const val MAX_BUFFER_SAMPLES = SAMPLE_RATE * 30
+        /**
+         * Min RMS (on float [-1,1] samples, after /32768) to run ASR.
+         * Silence/noise ~0.0001–0.001; real speech/media usually >> 0.01.
+         * Feeding silence to SenseVoice often yields 「我。」「。。」 hallucinations.
+         */
+        private const val MIN_CHUNK_RMS = 0.012
         private val FLUTTER_ASSET_PREFIXES = listOf(
             "flutter_assets/assets/models/",
             "assets/models/",
             "models/",
+        )
+        /** ASR outputs that are almost always silence/noise hallucinations. */
+        private val NOISE_TEXT = Regex(
+            """^[。．，,、！!？?\s的了呢吧啊嗯呃哦噢喔喂嘿呵哈呀哦我你他她它们这那]+$"""
         )
     }
 
