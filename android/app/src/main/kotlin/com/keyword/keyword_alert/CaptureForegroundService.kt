@@ -43,6 +43,11 @@ class CaptureForegroundService : Service() {
         var ready: Boolean = false
             private set
 
+        /** Shared playback capture started in this service (main thread). */
+        @Volatile
+        var audioCapture: AudioCapture? = null
+            private set
+
         private var virtualDisplay: VirtualDisplay? = null
         private var imageReader: ImageReader? = null
         private var projectionCallback: MediaProjection.Callback? = null
@@ -65,6 +70,11 @@ class CaptureForegroundService : Service() {
         }
 
         fun clearProjection() {
+            try {
+                audioCapture?.stop()
+            } catch (_: Exception) {
+            }
+            audioCapture = null
             try {
                 virtualDisplay?.release()
             } catch (_: Exception) {
@@ -163,9 +173,31 @@ class CaptureForegroundService : Service() {
                     null,
                 )
                 currentProjection = projection
-                ready = true
-                AppLog.i("CaptureForegroundService: projection ready (VirtualDisplay OK)")
-                broadcastReady(true)
+                AppLog.i("VirtualDisplay OK — starting AudioPlaybackCapture on main thread")
+
+                // Build AudioRecord HERE on main thread with Service context.
+                // Creating it later on a worker thread / without Context often fails with:
+                // "Error: could not register audio policy" on Android 14/OEM.
+                // Brief settle so AudioFlinger sees an active projection session.
+                mainLooper.postDelayed({
+                    if (currentProjection !== projection) {
+                        AppLog.w("Projection changed before audio start — abort")
+                        return@postDelayed
+                    }
+                    val capture = AudioCapture()
+                    val audioOk = capture.startPlaybackOnly(this@CaptureForegroundService, projection)
+                    if (!audioOk) {
+                        AppLog.e("AudioPlaybackCapture failed inside service")
+                        clearProjection()
+                        ready = false
+                        broadcastReady(false)
+                        return@postDelayed
+                    }
+                    audioCapture = capture
+                    ready = true
+                    AppLog.i("CaptureForegroundService: projection+audio ready mode=${capture.captureMode}")
+                    broadcastReady(true)
+                }, 150)
             } catch (e: Exception) {
                 AppLog.e("getMediaProjection in service failed", e)
                 clearProjection()
