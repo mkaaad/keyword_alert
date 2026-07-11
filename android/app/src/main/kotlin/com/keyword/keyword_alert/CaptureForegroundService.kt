@@ -75,8 +75,17 @@ class CaptureForegroundService : Service() {
             } catch (_: Exception) {
             }
             imageReader = null
+            val proj = currentProjection
+            val cb = projectionCallback
+            if (proj != null && cb != null) {
+                try {
+                    proj.unregisterCallback(cb)
+                } catch (_: Exception) {
+                }
+            }
+            projectionCallback = null
             try {
-                currentProjection?.stop()
+                proj?.stop()
             } catch (_: Exception) {
             }
             currentProjection = null
@@ -119,12 +128,26 @@ class CaptureForegroundService : Service() {
 
         // getMediaProjection must run after startForeground(MEDIA_PROJECTION).
         // Post to main looper — some OEMs require main thread.
-        Handler(Looper.getMainLooper()).post {
+        val mainLooper = Handler(Looper.getMainLooper())
+        mainLooper.post {
             try {
                 val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                 clearProjection()
                 val projection = mgr.getMediaProjection(resultCode, data)
                     ?: throw IllegalStateException("getMediaProjection returned null")
+
+                // API 34+: must registerCallback BEFORE createVirtualDisplay / audio capture,
+                // else IllegalStateException: Must register a callback before starting capture
+                val cb = object : MediaProjection.Callback() {
+                    override fun onStop() {
+                        AppLog.w("MediaProjection.onStop — user revoked or session ended")
+                        clearProjection()
+                        broadcastReady(false)
+                    }
+                }
+                projection.registerCallback(cb, mainLooper)
+                projectionCallback = cb
+                AppLog.i("MediaProjection.registerCallback OK")
 
                 // Real Surface required on many devices (null surface → silent/broken capture).
                 val reader = ImageReader.newInstance(2, 2, PixelFormat.RGBA_8888, 2)
