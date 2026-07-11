@@ -157,11 +157,8 @@ class AudioCapture {
 
             // API 31+: Builder(Context) sets opPackageName — required for AudioPolicy registration
             // on many Android 14 / OEM builds ("could not register audio policy").
-            val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                AudioRecord.Builder(context)
-            } else {
-                AudioRecord.Builder()
-            }
+            // Use reflection so older compileSdk / Flutter stubs still compile.
+            val builder = newAudioRecordBuilder(context)
 
             val record = builder
                 .setAudioFormat(
