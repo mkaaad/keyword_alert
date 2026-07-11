@@ -52,13 +52,11 @@ class AlarmService {
   Future<void> trigger({required String keyword, required int count}) async {
     if (_isRinging) return;
     _isRinging = true;
-    _usingNativeRingtone = false;
 
     // Prefer device default alarm ringtone (TYPE_ALARM / 闹钟音量).
     try {
       final ok = await _native.invokeMethod<bool>('playSystemAlarm');
       if (ok == true) {
-        _usingNativeRingtone = true;
         debugPrint('AlarmService: system alarm ringtone started');
       } else {
         await _playAssetFallback();
@@ -131,12 +129,14 @@ class AlarmService {
     } catch (e) {
       debugPrint('Alarm stop failed: $e');
     }
-    _usingNativeRingtone = false;
   }
 
   void dispose() {
     _alarmTimer?.cancel();
-    unawaited(stop());
+    _alarmTimer = null;
+    _isRinging = false;
+    unawaited(_native.invokeMethod<bool>('stopSystemAlarm').catchError((_) => false));
+    unawaited(_player.stop().catchError((_) {}));
     _player.dispose();
   }
 }
