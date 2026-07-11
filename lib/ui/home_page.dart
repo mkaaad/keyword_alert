@@ -26,8 +26,11 @@ class _HomePageState extends State<HomePage> {
   bool _isMonitoring = false;
   bool _isStarting = false;
   String _lastText = '等待识别...';
+  String _captureMode = 'none'; // playback | none
   int _hitCount = 0;
   final List<String> _recentTexts = [];
+  final List<String> _debugLogs = [];
+  final ScrollController _logScroll = ScrollController();
 
   @override
   void initState() {
@@ -35,10 +38,35 @@ class _HomePageState extends State<HomePage> {
     _loadConfig();
     _alarm.initialize();
     _initForegroundTask();
+    _audioCapture.listenLogs(_onNativeLog);
+    _appendLog('UI ready — 日志会显示在此，无需 adb');
+  }
+
+  void _onNativeLog(String line) {
+    if (!mounted) return;
+    setState(() {
+      _debugLogs.add(line);
+      if (_debugLogs.length > 300) {
+        _debugLogs.removeRange(0, _debugLogs.length - 300);
+      }
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_logScroll.hasClients) {
+        _logScroll.jumpTo(_logScroll.position.maxScrollExtent);
+      }
+    });
+  }
+
+  void _appendLog(String msg) {
+    final now = DateTime.now();
+    final t =
+        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
+    _onNativeLog('$t UI $msg');
   }
 
   @override
   void dispose() {
+    _logScroll.dispose();
     unawaited(_audioCapture.dispose());
     unawaited(_alarm.stop());
     _alarm.dispose();
@@ -126,24 +154,30 @@ class _HomePageState extends State<HomePage> {
     }
 
     setState(() => _isStarting = true);
+    _appendLog('开始监控…（将请求屏幕录制/投射）');
 
-    // Capture first (native starts mediaProjection FGS only AFTER user consents).
-    // Do not start Flutter FGS with mediaProjection type before consent — crashes on API 34.
-    final ok = await _audioCapture.start();
-    if (!ok) {
+    // Native: dialog first → mediaProjection FGS → AudioPlaybackCapture only (no mic).
+    final start = await _audioCapture.start();
+    _appendLog('start 结果 ok=${start.ok} mode=${start.mode} err=${start.error}');
+    if (!start.ok || !start.isPlayback) {
       if (mounted) {
-        setState(() => _isStarting = false);
+        setState(() {
+          _isStarting = false;
+          _captureMode = start.mode;
+        });
+        final err = start.error ?? 'unknown';
         await showDialog<void>(
           context: context,
           builder: (ctx) => AlertDialog(
-            title: const Text('启动失败'),
-            content: const Text(
-              '音频捕获启动失败。\n\n'
-              '请允许「屏幕录制/投射」权限（用于捕获 B站/会议等系统播放声音）。\n\n'
-              '其它可能原因：\n'
-              '1. 未授予录音/通知权限\n'
-              '2. 未允许前台服务通知\n'
-              '3. ASR 模型未正确打包',
+            title: const Text('系统内录未成功'),
+            content: Text(
+              '未能捕获其它 App 的播放声音（不会静默改用麦克风）。\n\n'
+              '错误码: $err\n\n'
+              '请确认：\n'
+              '1. 点了「立即开始」允许屏幕录制/投射\n'
+              '2. 通知栏允许本应用前台服务\n'
+              '3. 使用含应用内日志的新版本\n'
+              '4. 看下方「运行日志」定位原因',
             ),
             actions: [
               FilledButton(
@@ -180,7 +214,7 @@ class _HomePageState extends State<HomePage> {
     try {
       await FlutterForegroundTask.startService(
         notificationTitle: '关键词监控运行中',
-        notificationText: '正在监听「${_config.keyword}」',
+        notificationText: '系统内录 · 监听「${_config.keyword}」',
         callback: backgroundTaskCallback,
       );
     } catch (e) {
@@ -191,9 +225,10 @@ class _HomePageState extends State<HomePage> {
     setState(() {
       _isMonitoring = true;
       _isStarting = false;
+      _captureMode = start.mode;
       _hitCount = 0;
       _recentTexts.clear();
-      _lastText = '等待识别...';
+      _lastText = '等待识别...（系统内录）';
     });
   }
 
@@ -309,11 +344,15 @@ class _HomePageState extends State<HomePage> {
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         Text(
-                          _isMonitoring ? '🟢 监控中' : '⚪ 已停止',
+                          _isMonitoring
+                              ? (_captureMode == 'playback'
+                                  ? '🟢 系统内录'
+                                  : '🟡 监控中·$_captureMode')
+                              : '⚪ 已停止',
                           style: theme.textTheme.titleMedium,
                         ),
                         Text(
-                          '关键词: "${_config.keyword}"',
+                          '「${_config.keyword}」',
                           style: theme.textTheme.bodyMedium,
                         ),
                       ],
@@ -334,7 +373,7 @@ class _HomePageState extends State<HomePage> {
                 ),
               ),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 8),
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(12.0),
@@ -348,27 +387,112 @@ class _HomePageState extends State<HomePage> {
                 ),
               ),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 8),
             Expanded(
+              flex: 2,
               child: Card(
-                child: _recentTexts.isEmpty
-                    ? Center(
-                        child: Text(
-                          '识别记录将显示在这里',
-                          style: theme.textTheme.bodySmall,
-                        ),
-                      )
-                    : ListView.builder(
-                        padding: const EdgeInsets.all(8),
-                        itemCount: _recentTexts.length,
-                        itemBuilder: (_, i) => Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 2.0),
-                          child: Text(
-                            _recentTexts[i],
-                            style: theme.textTheme.bodySmall,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
+                      child: Row(
+                        children: [
+                          Text('识别记录', style: theme.textTheme.labelMedium),
+                          const Spacer(),
+                          Text(
+                            _recentTexts.isEmpty ? '暂无' : '${_recentTexts.length}条',
+                            style: theme.textTheme.labelSmall,
                           ),
-                        ),
+                        ],
                       ),
+                    ),
+                    Expanded(
+                      child: _recentTexts.isEmpty
+                          ? Center(
+                              child: Text(
+                                '有识别结果会显示在这里',
+                                style: theme.textTheme.bodySmall,
+                              ),
+                            )
+                          : ListView.builder(
+                              padding: const EdgeInsets.all(8),
+                              itemCount: _recentTexts.length,
+                              itemBuilder: (_, i) => Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 2.0),
+                                child: Text(
+                                  _recentTexts[i],
+                                  style: theme.textTheme.bodySmall,
+                                ),
+                              ),
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Expanded(
+              flex: 3,
+              child: Card(
+                color: Colors.black87,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(8, 8, 4, 0),
+                      child: Row(
+                        children: [
+                          Text(
+                            '运行日志（无需 adb）',
+                            style: theme.textTheme.labelMedium?.copyWith(
+                              color: Colors.white70,
+                            ),
+                          ),
+                          const Spacer(),
+                          TextButton(
+                            onPressed: () => setState(_debugLogs.clear),
+                            child: const Text('清空', style: TextStyle(fontSize: 12)),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Expanded(
+                      child: _debugLogs.isEmpty
+                          ? const Center(
+                              child: Text(
+                                '等待日志…',
+                                style: TextStyle(color: Colors.white38, fontSize: 12),
+                              ),
+                            )
+                          : ListView.builder(
+                              controller: _logScroll,
+                              padding: const EdgeInsets.all(8),
+                              itemCount: _debugLogs.length,
+                              itemBuilder: (_, i) {
+                                final line = _debugLogs[i];
+                                final color = line.contains(' E ')
+                                    ? Colors.redAccent
+                                    : line.contains(' W ')
+                                        ? Colors.orangeAccent
+                                        : line.contains('playback') ||
+                                                line.contains('ASR ok')
+                                            ? Colors.lightGreenAccent
+                                            : Colors.white70;
+                                return Text(
+                                  line,
+                                  style: TextStyle(
+                                    fontFamily: 'monospace',
+                                    fontSize: 10,
+                                    color: color,
+                                    height: 1.3,
+                                  ),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                ),
               ),
             ),
             const SizedBox(height: 16),

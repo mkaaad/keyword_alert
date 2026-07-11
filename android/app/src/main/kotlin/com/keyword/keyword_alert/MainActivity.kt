@@ -27,7 +27,7 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val TAG = "KeywordAlert"
         private const val REQ_MEDIA_PROJECTION = 1001
-        private const val PROJECTION_WAIT_MS = 1500L
+        private const val PROJECTION_WAIT_MS = 2500L
     }
 
     private var audioCapture: AudioCapture? = null
@@ -37,23 +37,22 @@ class MainActivity : FlutterActivity() {
     private var pendingStartResult: MethodChannel.Result? = null
     private var projectionManager: MediaProjectionManager? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val handledProjection = AtomicBoolean(false)
 
     private val projectionReadyReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != ACTION_PROJECTION_READY) return
             val ok = intent.getBooleanExtra(EXTRA_OK, false)
-            Log.i(TAG, "PROJECTION_READY ok=$ok")
+            AppLog.i("PROJECTION_READY ok=$ok")
             mainHandler.removeCallbacks(projectionTimeout)
             continueAfterProjection(ok)
         }
     }
 
     private val projectionTimeout = Runnable {
-        Log.w(TAG, "Projection ready timeout — try with whatever we have")
+        AppLog.w("Projection ready timeout ready=${CaptureForegroundService.ready}")
         continueAfterProjection(CaptureForegroundService.ready)
     }
-
-    private var waitingProjection = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -78,10 +77,11 @@ class MainActivity : FlutterActivity() {
             when (call.method) {
                 "startCapture" -> {
                     if (pendingStartResult != null) {
-                        result.success(false)
+                        result.success(mapOf("ok" to false, "mode" to "none", "error" to "busy"))
                         return@setMethodCallHandler
                     }
                     pendingStartResult = result
+                    handledProjection.set(false)
                     requestCapturePermissionOrStart()
                 }
                 "stopCapture" -> {
@@ -89,6 +89,7 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
                 "isActive" -> result.success(audioCapture?.isActive() ?: false)
+                "captureMode" -> result.success(audioCapture?.captureMode ?: "none")
                 else -> result.notImplemented()
             }
         }
@@ -107,14 +108,24 @@ class MainActivity : FlutterActivity() {
                 eventSink = null
             }
         })
+
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "com.keyword/debug_log"
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                AppLog.setSink(events)
+                AppLog.i("debug_log channel attached")
+            }
+
+            override fun onCancel(arguments: Any?) {
+                AppLog.setSink(null)
+            }
+        })
     }
 
-    /**
-     * Do NOT start mediaProjection-type FGS before the user accepts the dialog —
-     * that crashes on Android 14 / ColorOS.
-     * Only open the system consent UI here.
-     */
     private fun requestCapturePermissionOrStart() {
+        // Never start mediaProjection FGS before consent.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && projectionManager != null) {
             try {
                 startActivityForResult(
@@ -123,12 +134,11 @@ class MainActivity : FlutterActivity() {
                 )
                 return
             } catch (e: Exception) {
-                Log.w(TAG, "MediaProjection intent failed, fallback", e)
+                AppLog.w("MediaProjection intent failed", e)
             }
         }
-        Thread {
-            finishStart(startCaptureInternal(null))
-        }.start()
+        // No projection available (API < 29): do not pretend mic is OK for "system audio"
+        finishStart(ok = false, mode = "none", error = "no_media_projection")
     }
 
     @Deprecated("Deprecated in Java")
@@ -137,64 +147,63 @@ class MainActivity : FlutterActivity() {
         if (requestCode != REQ_MEDIA_PROJECTION) return
 
         if (resultCode != Activity.RESULT_OK || data == null) {
-            Log.e(TAG, "MediaProjection denied by user")
-            Thread {
-                finishStart(startCaptureInternal(null))
-            }.start()
+            AppLog.e("MediaProjection denied by user")
+            finishStart(ok = false, mode = "none", error = "projection_denied")
             return
         }
 
-        // After consent: start FGS with mediaProjection type, then getMediaProjection inside service.
-        waitingProjection = true
+        // User accepted → start FGS + getMediaProjection inside service (API 34 order).
         CaptureForegroundService.startWithProjection(this, resultCode, data)
         mainHandler.postDelayed(projectionTimeout, PROJECTION_WAIT_MS)
     }
 
     private fun continueAfterProjection(projectionOk: Boolean) {
-        if (!waitingProjection && pendingStartResult == null) return
-        waitingProjection = false
-        val projection: MediaProjection? =
+        if (!handledProjection.compareAndSet(false, true)) {
+            AppLog.i("Projection result already handled")
+            return
+        }
+        mainHandler.removeCallbacks(projectionTimeout)
+
+        val projection =
             if (projectionOk) CaptureForegroundService.currentProjection else null
+        if (projection == null) {
+            AppLog.e("No MediaProjection — refusing mic fallback")
+            finishStart(ok = false, mode = "none", error = "projection_failed")
+            return
+        }
+
         Thread {
-            val ok = startCaptureInternal(projection)
-            finishStart(ok)
+            val capture = AudioCapture()
+            // Only system playback path; no silent mic fallback.
+            val ok = capture.startPlaybackOnly(projection)
+            if (!ok) {
+                AppLog.e("AudioPlaybackCapture failed")
+                runOnUiThread {
+                    finishStart(ok = false, mode = "none", error = "playback_capture_failed")
+                }
+                return@Thread
+            }
+            runOnUiThread {
+                stopCaptureKeepService()
+                audioCapture = capture
+                val handler = AsrStreamHandler(capture, this@MainActivity)
+                asrStreamHandler = handler
+                handler.setSink(eventSink)
+                handler.start()
+                AppLog.i("AudioCapture started mode=${capture.captureMode}")
+                finishStart(ok = true, mode = capture.captureMode, error = null)
+            }
         }.start()
     }
 
-    private fun finishStart(ok: Boolean) {
-        runOnUiThread {
-            pendingStartResult?.success(ok)
-            pendingStartResult = null
-        }
-    }
-
-    private fun startCaptureInternal(projection: MediaProjection?): Boolean {
-        stopCaptureKeepService()
-
-        Log.i(TAG, "Requesting root (optional for grants)...")
-        if (execSu("id")) {
-            Log.i(TAG, "Root granted")
-            val pkg = packageName
-            execSu("pm grant $pkg android.permission.RECORD_AUDIO")
-            execSu("pm grant $pkg android.permission.CAPTURE_AUDIO_OUTPUT")
-            execSu("pm grant $pkg android.permission.POST_NOTIFICATIONS")
-        } else {
-            Log.w(TAG, "Root denied — MediaProjection path may still work")
-        }
-
-        val capture = AudioCapture()
-        val ok = capture.start(projection)
-        if (!ok) {
-            Log.e(TAG, "AudioCapture failed")
-            return false
-        }
-        audioCapture = capture
-        val handler = AsrStreamHandler(capture, this@MainActivity)
-        asrStreamHandler = handler
-        handler.setSink(eventSink)
-        handler.start()
-        Log.i(TAG, "AudioCapture started (projection=${projection != null})")
-        return true
+    private fun finishStart(ok: Boolean, mode: String, error: String?) {
+        val map = hashMapOf<String, Any?>(
+            "ok" to ok,
+            "mode" to mode,
+            "error" to error,
+        )
+        pendingStartResult?.success(map)
+        pendingStartResult = null
     }
 
     private fun stopCaptureKeepService() {
@@ -205,20 +214,11 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun stopCapture() {
-        waitingProjection = false
+        handledProjection.set(false)
         mainHandler.removeCallbacks(projectionTimeout)
         stopCaptureKeepService()
         CaptureForegroundService.clearProjection()
         CaptureForegroundService.stop(this)
-    }
-
-    private fun execSu(command: String): Boolean {
-        return try {
-            Runtime.getRuntime().exec(arrayOf("su", "-c", command)).waitFor() == 0
-        } catch (e: Exception) {
-            Log.w(TAG, "su failed: $command", e)
-            false
-        }
     }
 
     override fun onDestroy() {
@@ -237,7 +237,6 @@ class AudioCapture {
         const val CHANNEL = AudioFormat.CHANNEL_IN_MONO
         const val ENCODING = AudioFormat.ENCODING_PCM_16BIT
         private const val TAG = "KeywordAlert"
-        private const val SOURCE_REMOTE_SUBMIX = MediaRecorder.AudioSource.REMOTE_SUBMIX
     }
 
     private var audioRecord: AudioRecord? = null
@@ -247,69 +246,77 @@ class AudioCapture {
     @Volatile var hasNewData = false
     @Volatile var lastRms: Double = 0.0
     @Volatile var totalFrames: Long = 0
-    /** playback | remote_submix | mic — for diagnostics */
     @Volatile var captureMode: String = "none"
 
-    fun start(projection: MediaProjection? = null): Boolean {
-        if (isRunning.get()) return true
+    /**
+     * System-app playback only (Bilibili / Meeting). Never falls back to microphone.
+     */
+    fun startPlaybackOnly(projection: MediaProjection): Boolean {
+        if (isRunning.get()) return captureMode == "playback"
+        stop()
+
         val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, ENCODING)
         if (minBuf == AudioRecord.ERROR || minBuf == AudioRecord.ERROR_BAD_VALUE) {
-            Log.e(TAG, "Invalid min buffer size: $minBuf")
+            AppLog.e("Invalid min buffer size: $minBuf")
             return false
         }
-        val bufSize = maxOf(minBuf, SAMPLE_RATE * 2)
+        val bufSize = maxOf(minBuf * 2, SAMPLE_RATE * 2)
 
-        captureMode = "none"
-        audioRecord = createPlaybackCaptureRecord(projection, bufSize)?.also {
-            captureMode = "playback"
-        } ?: createRemoteSubmixRecord(bufSize)?.also {
-            captureMode = "remote_submix"
-        } ?: tryCreateFallbackRecord(bufSize)?.also {
-            captureMode = "mic"
-        }
-        Log.i(TAG, "Capture mode selected: $captureMode projection=${projection != null}")
-
-        if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-            Log.e(TAG, "AudioRecord not init, state=${audioRecord?.state}")
-            audioRecord?.release()
-            audioRecord = null
+        // Prefer 16 kHz mono; if OEM rejects, try 48 kHz and we'll still feed ASR at 16k
+        // (AudioPlaybackCapture resamples when possible).
+        audioRecord = createPlaybackCaptureRecord(projection, bufSize, SAMPLE_RATE)
+            ?: createPlaybackCaptureRecord(projection, bufSize, 48000)
+        if (audioRecord == null) {
+            captureMode = "none"
+            AppLog.e("AudioPlaybackCapture unavailable")
             return false
         }
+        captureMode = "playback"
+        AppLog.i("Capture mode: playback (system audio)")
 
         try {
             audioRecord!!.startRecording()
         } catch (e: Exception) {
-            Log.e(TAG, "startRecording failed", e)
+            AppLog.e("startRecording failed", e)
             audioRecord?.release()
             audioRecord = null
+            captureMode = "none"
             return false
         }
 
+        val recordSampleRate = audioRecord!!.sampleRate
         isRunning.set(true)
         totalFrames = 0
         thread = Thread {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-            val buf = ShortArray(SAMPLE_RATE / 10)
+            val buf = ShortArray(recordSampleRate / 10)
             var logCounter = 0
             while (isRunning.get()) {
                 val read = audioRecord?.read(buf, 0, buf.size) ?: -1
                 if (read > 0) {
                     var sum = 0.0
+                    // Downsample 48k → 16k if needed (keep every 3rd sample)
+                    val step = if (recordSampleRate >= 48000) 3 else 1
                     synchronized(audioBuffer) {
-                        for (i in 0 until read) {
+                        var i = 0
+                        while (i < read) {
                             val s = buf[i]
                             audioBuffer.add(s)
                             sum += s * s
+                            i += step
                         }
                     }
-                    lastRms = kotlin.math.sqrt(sum / read)
-                    totalFrames += read
+                    val n = (read + step - 1) / step
+                    lastRms = if (n > 0) kotlin.math.sqrt(sum / n) else 0.0
+                    totalFrames += n
                     hasNewData = true
                     if (++logCounter % 50 == 0) {
-                        Log.i(TAG, "Audio RMS=$lastRms frames=$totalFrames buf=${audioBuffer.size}")
+                        AppLog.i(
+                            "Audio mode=$captureMode rate=$recordSampleRate RMS=$lastRms frames=$totalFrames buf=${audioBuffer.size}",
+                        )
                     }
                 } else if (read < 0) {
-                    Log.w(TAG, "AudioRecord.read error: $read")
+                    AppLog.w("AudioRecord.read error: $read")
                     try {
                         Thread.sleep(50)
                     } catch (_: InterruptedException) {
@@ -325,23 +332,25 @@ class AudioCapture {
     }
 
     private fun createPlaybackCaptureRecord(
-        projection: MediaProjection?,
+        projection: MediaProjection,
         bufSize: Int,
+        sampleRate: Int,
     ): AudioRecord? {
-        if (projection == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
         return try {
-            Log.i(TAG, "Trying AudioPlaybackCapture (MediaProjection)...")
+            AppLog.i("Trying AudioPlaybackCapture sampleRate=$sampleRate...")
             val config = AudioPlaybackCaptureConfiguration.Builder(projection)
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                 .addMatchingUsage(AudioAttributes.USAGE_GAME)
                 .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
                 .addMatchingUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .addMatchingUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
                 .build()
             val record = AudioRecord.Builder()
                 .setAudioFormat(
                     AudioFormat.Builder()
                         .setEncoding(ENCODING)
-                        .setSampleRate(SAMPLE_RATE)
+                        .setSampleRate(sampleRate)
                         .setChannelMask(CHANNEL)
                         .build()
                 )
@@ -349,77 +358,17 @@ class AudioCapture {
                 .setAudioPlaybackCaptureConfig(config)
                 .build()
             if (record.state == AudioRecord.STATE_INITIALIZED) {
-                Log.i(TAG, "AudioPlaybackCapture OK")
+                AppLog.i("AudioPlaybackCapture OK rate=$sampleRate")
                 record
             } else {
-                Log.w(TAG, "AudioPlaybackCapture not initialized, state=${record.state}")
+                AppLog.w("AudioPlaybackCapture not initialized state=${record.state} rate=$sampleRate")
                 record.release()
                 null
             }
         } catch (e: Exception) {
-            Log.w(TAG, "AudioPlaybackCapture failed", e)
+            AppLog.w("AudioPlaybackCapture failed rate=$sampleRate", e)
             null
         }
-    }
-
-    private fun createRemoteSubmixRecord(bufSize: Int): AudioRecord? {
-        return try {
-            Log.i(TAG, "Trying REMOTE_SUBMIX (source=$SOURCE_REMOTE_SUBMIX)...")
-            val record = AudioRecord.Builder()
-                .setAudioSource(SOURCE_REMOTE_SUBMIX)
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(ENCODING)
-                        .setSampleRate(SAMPLE_RATE)
-                        .setChannelMask(CHANNEL)
-                        .build()
-                )
-                .setBufferSizeInBytes(bufSize)
-                .build()
-            if (record.state == AudioRecord.STATE_INITIALIZED) {
-                Log.i(TAG, "REMOTE_SUBMIX OK")
-                record
-            } else {
-                Log.w(TAG, "REMOTE_SUBMIX not initialized, state=${record.state}")
-                record.release()
-                null
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "REMOTE_SUBMIX failed", e)
-            null
-        }
-    }
-
-    private fun tryCreateFallbackRecord(bufSize: Int): AudioRecord? {
-        val sources = listOf(
-            MediaRecorder.AudioSource.UNPROCESSED,
-            MediaRecorder.AudioSource.VOICE_RECOGNITION,
-            MediaRecorder.AudioSource.DEFAULT,
-            MediaRecorder.AudioSource.MIC,
-        )
-        for (source in sources) {
-            try {
-                val record = AudioRecord.Builder()
-                    .setAudioSource(source)
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(ENCODING)
-                            .setSampleRate(SAMPLE_RATE)
-                            .setChannelMask(CHANNEL)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(bufSize)
-                    .build()
-                if (record.state == AudioRecord.STATE_INITIALIZED) {
-                    Log.i(TAG, "Fallback AudioRecord source=$source OK (mic path — not system audio)")
-                    return record
-                }
-                record.release()
-            } catch (e: Exception) {
-                Log.w(TAG, "Fallback source=$source failed", e)
-            }
-        }
-        return null
     }
 
     fun stop() {
@@ -440,6 +389,7 @@ class AudioCapture {
         }
         audioRecord = null
         synchronized(audioBuffer) { audioBuffer.clear() }
+        captureMode = "none"
     }
 
     fun isActive() = isRunning.get()

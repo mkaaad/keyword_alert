@@ -77,7 +77,7 @@ class AsrStreamHandler(
         context.assets.open(assetPath).use { input ->
             dest.outputStream().use { output -> input.copyTo(output) }
         }
-        Log.i(TAG, "Copied asset $assetPath -> ${dest.absolutePath} (${dest.length()} bytes)")
+        AppLog.i("Copied asset $assetPath -> ${dest.absolutePath} (${dest.length()} bytes)")
     }
 
     private fun resolveAssetPath(name: String): String? {
@@ -144,9 +144,9 @@ class AsrStreamHandler(
                     decodingMethod = "greedy_search"
                     maxActivePaths = 4
                 }
-                Log.i(TAG, "Creating OfflineRecognizer model=$modelPath tokens=$tokensPath")
+                AppLog.i("Creating OfflineRecognizer model=$modelPath tokens=$tokensPath")
                 recognizer = OfflineRecognizer(assetManager = null, config = config)
-                Log.i(TAG, "OfflineRecognizer ready (SenseVoice)")
+                AppLog.i("OfflineRecognizer ready (SenseVoice)")
 
                 val samplesPerChunk = (SAMPLE_RATE * CHUNK_MS / 1000).toInt()
 
@@ -156,7 +156,7 @@ class AsrStreamHandler(
                         val overflow = audioCapture.audioBuffer.size - MAX_BUFFER_SAMPLES
                         if (overflow > 0) {
                             repeat(overflow) { audioCapture.audioBuffer.removeAt(0) }
-                            Log.w(TAG, "Audio buffer overflow, dropped $overflow samples")
+                            AppLog.w("Audio buffer overflow, dropped $overflow samples")
                         }
                     }
 
@@ -179,30 +179,52 @@ class AsrStreamHandler(
                         arr
                     }
 
+                    var sumSq = 0.0
+                    for (v in chunk) sumSq += v * v
+                    val rms = kotlin.math.sqrt(sumSq / chunk.size)
+                    if (rms < MIN_CHUNK_RMS) {
+                        AppLog.d(
+                            "Skip low-energy chunk rms=%.5f mode=%s (silence/noise gate)".format(
+                                rms,
+                                audioCapture.captureMode,
+                            ),
+                        )
+                        continue
+                    }
+
                     val stream = recognizer!!.createStream()
                     try {
                         stream.acceptWaveform(chunk, SAMPLE_RATE)
                         recognizer!!.decode(stream)
-                        val text = recognizer!!.getResult(stream).text.trim()
-                        if (text.isNotEmpty()) {
-                            // EventChannel.EventSink must be invoked on the main thread
+                        val raw = recognizer!!.getResult(stream).text.trim()
+                        val text = cleanAsrText(raw)
+                        if (text != null) {
+                            AppLog.i(
+                                "ASR ok rms=%.4f mode=%s text=%s".format(
+                                    rms,
+                                    audioCapture.captureMode,
+                                    text,
+                                ),
+                            )
                             val s = sink
                             if (s != null) {
                                 mainHandler.post {
                                     try {
                                         s.success(text)
                                     } catch (e: Exception) {
-                                        Log.w(TAG, "Failed to emit ASR text", e)
+                                        AppLog.w("Failed to emit ASR text", e)
                                     }
                                 }
                             }
+                        } else if (raw.isNotEmpty()) {
+                            AppLog.d("Drop noise-like ASR: '$raw' rms=%.4f".format(rms))
                         }
                     } finally {
                         stream.release()
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "ASR thread failed", e)
+                AppLog.e("ASR thread failed", e)
                 val s = sink
                 if (s != null) {
                     mainHandler.post {
@@ -233,5 +255,20 @@ class AsrStreamHandler(
         thread = null
         recognizer?.release()
         recognizer = null
+    }
+
+    /** Null if empty or likely SenseVoice silence hallucination. */
+    private fun cleanAsrText(raw: String): String? {
+        var t = raw
+            .replace(Regex("""<\|[^|]*\|>"""), "") // SenseVoice tags
+            .replace(Regex("""\s+"""), "")
+            .trim()
+        if (t.isEmpty()) return null
+        // Pure punctuation / filler / 「我。」 spam
+        if (NOISE_TEXT.matches(t)) return null
+        if (t.length <= 2 && t.all { it == '我' || it == '。' || it == '.' || it == '嗯' }) {
+            return null
+        }
+        return t
     }
 }

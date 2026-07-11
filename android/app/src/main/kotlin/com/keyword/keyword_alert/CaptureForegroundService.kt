@@ -8,21 +8,24 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
-import android.view.Surface
 
 /**
- * Holds the active [MediaProjection] for the app process.
- * Must only be started **after** the user accepts the screen-capture dialog.
+ * After the user accepts screen capture, this service:
+ * 1) startForeground(MEDIA_PROJECTION)
+ * 2) getMediaProjection + VirtualDisplay (keeps session alive)
  *
- * Android 14+: call [startForeground] with MEDIA_PROJECTION type, then
- * [MediaProjectionManager.getMediaProjection] in that order inside this service.
+ * Never start this service before the consent dialog — that crashes on API 34/ColorOS.
  */
 class CaptureForegroundService : Service() {
     companion object {
@@ -41,10 +44,12 @@ class CaptureForegroundService : Service() {
             private set
 
         private var virtualDisplay: VirtualDisplay? = null
+        private var imageReader: ImageReader? = null
 
         fun startWithProjection(context: Context, resultCode: Int, data: Intent) {
             val intent = Intent(context, CaptureForegroundService::class.java).apply {
                 putExtra(EXTRA_RESULT_CODE, resultCode)
+                // Intent is Parcelable; copy to survive process/service start
                 putExtra(EXTRA_RESULT_DATA, data)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -65,6 +70,11 @@ class CaptureForegroundService : Service() {
             }
             virtualDisplay = null
             try {
+                imageReader?.close()
+            } catch (_: Exception) {
+            }
+            imageReader = null
+            try {
                 currentProjection?.stop()
             } catch (_: Exception) {
             }
@@ -81,50 +91,74 @@ class CaptureForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // 1) Become FGS immediately (required within time limit of startForegroundService)
-        promoteToForeground(withMediaProjectionType = intent?.hasExtra(EXTRA_RESULT_CODE) == true)
+        val hasProjectionExtras = intent?.hasExtra(EXTRA_RESULT_CODE) == true &&
+            intent.hasExtra(EXTRA_RESULT_DATA)
 
-        val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
-        val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent?.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent?.getParcelableExtra(EXTRA_RESULT_DATA)
+        // Always enter foreground immediately (startForegroundService deadline).
+        promoteToForeground(withMediaProjectionType = hasProjectionExtras)
+
+        if (!hasProjectionExtras || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return START_STICKY
         }
 
-        if (resultCode != 0 && data != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        val resultCode = intent!!.getIntExtra(EXTRA_RESULT_CODE, 0)
+        val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra(EXTRA_RESULT_DATA)
+        }
+
+        if (resultCode == 0 || data == null) {
+            AppLog.e("Missing projection result extras")
+            ready = false
+            broadcastReady(false)
+            return START_STICKY
+        }
+
+        // getMediaProjection must run after startForeground(MEDIA_PROJECTION).
+        // Post to main looper — some OEMs require main thread.
+        Handler(Looper.getMainLooper()).post {
             try {
                 val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                 clearProjection()
-                // FGS already running with mediaProjection type → getMediaProjection allowed
                 val projection = mgr.getMediaProjection(resultCode, data)
-                currentProjection = projection
-                virtualDisplay = projection?.createVirtualDisplay(
+                    ?: throw IllegalStateException("getMediaProjection returned null")
+
+                // Real Surface required on many devices (null surface → silent/broken capture).
+                val reader = ImageReader.newInstance(2, 2, PixelFormat.RGBA_8888, 2)
+                imageReader = reader
+                virtualDisplay = projection.createVirtualDisplay(
                     "keyword_alert_cap",
                     2,
                     2,
-                    1,
+                    resources.displayMetrics.densityDpi.coerceAtLeast(160),
                     DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                    null as Surface?,
+                    reader.surface,
                     null,
                     null,
                 )
-                ready = projection != null
-                Log.i(TAG, "CaptureForegroundService: projection ready=$ready")
-                // Notify activity if waiting
-                sendBroadcast(Intent(ACTION_PROJECTION_READY).setPackage(packageName).apply {
-                    putExtra(EXTRA_OK, ready)
-                })
+                currentProjection = projection
+                ready = true
+                AppLog.i("CaptureForegroundService: projection ready (VirtualDisplay OK)")
+                broadcastReady(true)
             } catch (e: Exception) {
-                Log.e(TAG, "getMediaProjection in service failed", e)
+                AppLog.e("getMediaProjection in service failed", e)
+                clearProjection()
                 ready = false
-                sendBroadcast(Intent(ACTION_PROJECTION_READY).setPackage(packageName).apply {
-                    putExtra(EXTRA_OK, false)
-                })
+                broadcastReady(false)
             }
         }
 
         return START_STICKY
+    }
+
+    private fun broadcastReady(ok: Boolean) {
+        sendBroadcast(
+            Intent(ACTION_PROJECTION_READY).setPackage(packageName).apply {
+                putExtra(EXTRA_OK, ok)
+            },
+        )
     }
 
     private fun createChannel() {
@@ -156,7 +190,7 @@ class CaptureForegroundService : Service() {
         }
         val notification = builder
             .setContentTitle("关键词监控")
-            .setContentText("正在捕获系统音频…")
+            .setContentText(if (withMediaProjectionType) "系统内录运行中…" else "监控服务运行中…")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(pi)
             .setOngoing(true)
@@ -169,14 +203,14 @@ class CaptureForegroundService : Service() {
             }
             try {
                 startForeground(NOTIF_ID, notification, type)
-                Log.i(TAG, "startForeground mediaProjection|microphone OK")
+                AppLog.i("startForeground mediaProjection|microphone OK")
                 return
             } catch (e: Exception) {
-                Log.w(TAG, "startForeground typed failed, plain fallback", e)
+                AppLog.e("startForeground MEDIA_PROJECTION failed", e)
+                // Fall through — may still try plain (getMediaProjection will fail without type)
             }
         }
 
-        // Before consent / fallback: microphone only (or plain) — never mediaProjection alone pre-consent
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             try {
                 startForeground(
@@ -186,14 +220,14 @@ class CaptureForegroundService : Service() {
                 )
                 return
             } catch (e: Exception) {
-                Log.w(TAG, "startForeground microphone failed", e)
+                AppLog.w("startForeground microphone failed", e)
             }
         }
         startForeground(NOTIF_ID, notification)
     }
 
     override fun onDestroy() {
-        Log.i(TAG, "CaptureForegroundService destroyed")
+        AppLog.i("CaptureForegroundService destroyed")
         clearProjection()
         super.onDestroy()
     }
