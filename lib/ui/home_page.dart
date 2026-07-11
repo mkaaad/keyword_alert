@@ -17,7 +17,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final AudioCaptureService _audioCapture = AudioCaptureService();
   final AlarmService _alarm = AlarmService();
 
-  MonitorConfig _config = MonitorConfig.defaultConfig;
+  MonitorConfig _config = MonitorConfig.defaultConfig();
   KeywordMonitor? _monitor;
   bool _isMonitoring = false;
   bool _isStarting = false;
