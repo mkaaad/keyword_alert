@@ -1,0 +1,6 @@
+id=keyword_alert
+name=Keyword Alert
+version=v1.9
+versionCode=1
+author=crush
+description=Tencent Meeting keyword frequency monitor with offline ASR

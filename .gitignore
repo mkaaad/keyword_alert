@@ -1,0 +1,13 @@
+.DS_Store
+*.log
+local.properties
+.idea/
+.flutter-plugins*
+/build/
+/android/.gradle/
+/android/app/build/
+*.apk
+*.ap_
+*.aab
+*.zip
+

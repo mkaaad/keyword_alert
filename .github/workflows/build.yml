@@ -1,0 +1,57 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          flutter-version: '3.29.x'
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-34 build-tools;34.0.0 ndk;27.0.12077973'
+
+      - name: Download model
+        run: bash setup.sh
+
+      - name: Build APK
+        run: flutter build apk --release --split-per-abi
+
+      - name: Package Magisk module
+        run: |
+          MODULE_DIR="magisk_module"
+          mkdir -p "$MODULE_DIR/system/priv-app/KeywordAlert"
+          APK=$(find build/app/outputs/apk/release -name "*arm64*" -name "*.apk" | head -1)
+          [ -z "$APK" ] && APK=$(find build/app/outputs/apk/release -name "*.apk" | head -1)
+          cp "$APK" "$MODULE_DIR/system/priv-app/KeywordAlert/KeywordAlert.apk"
+          cd "$MODULE_DIR"
+          zip -r ../keyword_alert_magisk.zip . -x "*.DS_Store"
+          cd ..
+          echo "ZIP_SIZE=$(du -h keyword_alert_magisk.zip | cut -f1)" >> "$GITHUB_ENV"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: keyword_alert_magisk.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
