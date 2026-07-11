@@ -1,6 +1,6 @@
 id=keyword_alert
 name=Keyword Alert
-version=v2.0
-versionCode=2
+version=v2.1
+versionCode=3
 author=crush
 description=Tencent Meeting keyword frequency monitor with offline ASR (SenseVoice)

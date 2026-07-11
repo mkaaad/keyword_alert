@@ -1,7 +1,7 @@
 name: keyword_alert
 description: "Tencent Meeting keyword frequency monitor - alarm when '老师' is detected too often"
 publish_to: 'none'
-version: 0.1.0
+version: 0.2.0+2002
 
 environment:
   sdk: ">=3.7.0 <4.0.0"

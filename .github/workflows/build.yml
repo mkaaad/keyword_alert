@@ -45,7 +45,8 @@ jobs:
       - name: Build APK
         run: |
           set -euo pipefail
-          flutter build apk --release
+          # arm64-only: smaller package; OnePlus Ace 3 is arm64-v8a
+          flutter build apk --release --target-platform android-arm64
           APK=build/app/outputs/flutter-apk/app-release.apk
           if [ ! -f "$APK" ]; then
             echo "Expected APK missing: $APK"
@@ -58,15 +59,9 @@ jobs:
       - name: Package Magisk module
         run: |
           set -euo pipefail
-          MODULE_DIR="magisk_module"
-          mkdir -p "$MODULE_DIR/system/priv-app/KeywordAlert"
-          APK="${APK_PATH:-build/app/outputs/flutter-apk/app-release.apk}"
-          [ -f "$APK" ] || { echo "APK not found: $APK"; exit 1; }
-          cp "$APK" "$MODULE_DIR/system/priv-app/KeywordAlert/KeywordAlert.apk"
-          echo "Packaged APK: $APK ($(du -h "$MODULE_DIR/system/priv-app/KeywordAlert/KeywordAlert.apk" | cut -f1))"
-          cd "$MODULE_DIR"
-          zip -r ../keyword_alert_magisk.zip . -x "*.DS_Store"
-          cd ..
+          # Extracts lib/arm64-v8a/*.so into priv-app/.../lib/arm64/ (required
+          # for system installs — PM does not extract APK native libs for Magisk).
+          bash scripts/package_magisk.sh "${APK_PATH:-build/app/outputs/flutter-apk/app-release.apk}"
           ls -lh keyword_alert_magisk.zip
 
       - name: Create Release

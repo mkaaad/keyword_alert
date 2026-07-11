@@ -1,7 +1,14 @@
 #!/system/bin/sh
 
 ui_print "=== Keyword Alert ==="
-ui_print "  version: v2.0"
+ui_print "  version: v2.1"
+
+# Require pre-extracted native libs next to the APK (Flutter needs libapp.so)
+if [ ! -f "$MODPATH/system/priv-app/KeywordAlert/lib/arm64/libapp.so" ] && \
+   [ ! -f "$MODPATH/system/priv-app/KeywordAlert/lib/arm64/libflutter.so" ]; then
+    ui_print "  WARNING: native libs missing under lib/arm64/"
+    ui_print "  App will crash on launch (VM snapshot invalid)."
+fi
 
 APK_PATH="$MODPATH/system/priv-app/KeywordAlert/KeywordAlert.apk"
 if [ -f "$APK_PATH" ]; then
