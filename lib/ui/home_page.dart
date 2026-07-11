@@ -126,8 +126,23 @@ class _HomePageState extends State<HomePage> {
     }
 
     setState(() => _isStarting = true);
+
+    // Android 14+: keep-alive FGS should be up before / while capturing.
+    try {
+      await FlutterForegroundTask.startService(
+        notificationTitle: '关键词监控运行中',
+        notificationText: '正在监听「${_config.keyword}」',
+        callback: backgroundTaskCallback,
+      );
+    } catch (e) {
+      debugPrint('startService failed: $e');
+    }
+
     final ok = await _audioCapture.start();
     if (!ok) {
+      try {
+        await FlutterForegroundTask.stopService();
+      } catch (_) {}
       if (mounted) {
         setState(() => _isStarting = false);
         await showDialog<void>(
@@ -138,8 +153,8 @@ class _HomePageState extends State<HomePage> {
               '音频捕获启动失败。\n\n'
               '请允许「屏幕录制/投射」权限（用于捕获 B站/会议等系统播放声音）。\n\n'
               '其它可能原因：\n'
-              '1. 未授予 Root（可选，用于权限授权）\n'
-              '2. 未授予录音/通知权限\n'
+              '1. 未授予录音/通知权限\n'
+              '2. 未允许前台服务通知\n'
               '3. ASR 模型未正确打包',
             ),
             actions: [
@@ -173,16 +188,6 @@ class _HomePageState extends State<HomePage> {
         }
       },
     );
-
-    try {
-      await FlutterForegroundTask.startService(
-        notificationTitle: '关键词监控运行中',
-        notificationText: '正在监听「${_config.keyword}」',
-        callback: backgroundTaskCallback,
-      );
-    } catch (e) {
-      debugPrint('startService failed: $e');
-    }
 
     if (!mounted) return;
     setState(() {

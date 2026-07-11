@@ -13,6 +13,8 @@ import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.Process
 import android.util.Log
 import android.view.Surface
@@ -26,6 +28,8 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val TAG = "KeywordAlert"
         private const val REQ_MEDIA_PROJECTION = 1001
+        /** Delay after starting FGS so startForeground has run before getMediaProjection. */
+        private const val FGS_READY_MS = 400L
     }
 
     private var audioCapture: AudioCapture? = null
@@ -36,6 +40,7 @@ class MainActivity : FlutterActivity() {
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var projectionManager: MediaProjectionManager? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -48,7 +53,6 @@ class MainActivity : FlutterActivity() {
         ).setMethodCallHandler { call, result ->
             when (call.method) {
                 "startCapture" -> {
-                    // MediaProjection permission UI must run on main thread.
                     if (pendingStartResult != null) {
                         result.success(false)
                         return@setMethodCallHandler
@@ -82,21 +86,23 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun requestCapturePermissionOrStart() {
-        // Prefer AudioPlaybackCapture (captures Bilibili / Meeting speaker audio).
-        // Requires one-time MediaProjection consent.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && projectionManager != null) {
-            try {
-                val intent = projectionManager!!.createScreenCaptureIntent()
-                startActivityForResult(intent, REQ_MEDIA_PROJECTION)
-                return
-            } catch (e: Exception) {
-                Log.w(TAG, "MediaProjection intent failed, fallback to REMOTE_SUBMIX", e)
+        // Android 14+: FGS type mediaProjection MUST be running before getMediaProjection.
+        CaptureForegroundService.start(this)
+        mainHandler.postDelayed({
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && projectionManager != null) {
+                try {
+                    val intent = projectionManager!!.createScreenCaptureIntent()
+                    startActivityForResult(intent, REQ_MEDIA_PROJECTION)
+                    return@postDelayed
+                } catch (e: Exception) {
+                    Log.w(TAG, "MediaProjection intent failed, fallback", e)
+                }
             }
-        }
-        Thread {
-            val ok = startCaptureInternal(projection = null)
-            finishStart(ok)
-        }.start()
+            Thread {
+                val ok = startCaptureInternal(projection = null)
+                finishStart(ok)
+            }.start()
+        }, FGS_READY_MS)
     }
 
     @Deprecated("Deprecated in Java")
@@ -106,7 +112,6 @@ class MainActivity : FlutterActivity() {
 
         if (resultCode != Activity.RESULT_OK || data == null || projectionManager == null) {
             Log.e(TAG, "MediaProjection denied by user")
-            // Still try REMOTE_SUBMIX / mic fallback
             Thread {
                 val ok = startCaptureInternal(projection = null)
                 finishStart(ok)
@@ -114,36 +119,40 @@ class MainActivity : FlutterActivity() {
             return
         }
 
-        try {
-            virtualDisplay?.release()
-        } catch (_: Exception) {
-        }
-        virtualDisplay = null
-        try {
-            mediaProjection?.stop()
-        } catch (_: Exception) {
-        }
-        try {
-            mediaProjection = projectionManager!!.getMediaProjection(resultCode, data)
-            // Some OEMs keep the projection session only while a VirtualDisplay exists.
-            virtualDisplay = mediaProjection?.createVirtualDisplay(
-                "keyword_alert_cap",
-                2,
-                2,
-                1,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                null as Surface?,
-                null,
-                null,
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "getMediaProjection failed", e)
-            mediaProjection = null
-        }
-        Thread {
-            val ok = startCaptureInternal(projection = mediaProjection)
-            finishStart(ok)
-        }.start()
+        // Ensure FGS is still up (user may have spent time on the consent dialog).
+        CaptureForegroundService.start(this)
+        mainHandler.postDelayed({
+            try {
+                virtualDisplay?.release()
+            } catch (_: Exception) {
+            }
+            virtualDisplay = null
+            try {
+                mediaProjection?.stop()
+            } catch (_: Exception) {
+            }
+            try {
+                mediaProjection = projectionManager!!.getMediaProjection(resultCode, data)
+                Log.i(TAG, "getMediaProjection OK")
+                virtualDisplay = mediaProjection?.createVirtualDisplay(
+                    "keyword_alert_cap",
+                    2,
+                    2,
+                    1,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    null as Surface?,
+                    null,
+                    null,
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "getMediaProjection failed", e)
+                mediaProjection = null
+            }
+            Thread {
+                val ok = startCaptureInternal(projection = mediaProjection)
+                finishStart(ok)
+            }.start()
+        }, FGS_READY_MS)
     }
 
     private fun finishStart(ok: Boolean) {
@@ -177,12 +186,7 @@ class MainActivity : FlutterActivity() {
         val handler = AsrStreamHandler(capture, this@MainActivity)
         asrStreamHandler = handler
         handler.setSink(eventSink)
-        if (eventSink != null) {
-            handler.start()
-        } else {
-            // ASR thread starts when EventChannel listens; also start optimistically
-            handler.start()
-        }
+        handler.start()
         Log.i(TAG, "AudioCapture started (projection=${projection != null})")
         return true
     }
@@ -206,6 +210,7 @@ class MainActivity : FlutterActivity() {
         } catch (_: Exception) {
         }
         mediaProjection = null
+        CaptureForegroundService.stop(this)
     }
 
     private fun execSu(command: String): Boolean {
@@ -229,7 +234,6 @@ class AudioCapture {
         const val CHANNEL = AudioFormat.CHANNEL_IN_MONO
         const val ENCODING = AudioFormat.ENCODING_PCM_16BIT
         private const val TAG = "KeywordAlert"
-        // MediaRecorder.AudioSource.REMOTE_SUBMIX == 8 (NOT 7 = VOICE_COMMUNICATION)
         private const val SOURCE_REMOTE_SUBMIX = MediaRecorder.AudioSource.REMOTE_SUBMIX
     }
 
@@ -309,7 +313,6 @@ class AudioCapture {
         return true
     }
 
-    /** Capture other apps' playback (Bilibili, Meeting, etc.). Needs MediaProjection. */
     private fun createPlaybackCaptureRecord(
         projection: MediaProjection?,
         bufSize: Int,
@@ -348,7 +351,6 @@ class AudioCapture {
         }
     }
 
-    /** System remote submix — only audio routed to remote_submix (cast), needs CAPTURE_AUDIO_OUTPUT. */
     private fun createRemoteSubmixRecord(bufSize: Int): AudioRecord? {
         return try {
             Log.i(TAG, "Trying REMOTE_SUBMIX (source=$SOURCE_REMOTE_SUBMIX)...")
