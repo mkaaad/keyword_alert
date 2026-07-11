@@ -520,22 +520,31 @@ class _HomePageState extends State<HomePage> {
                 ),
               ),
             ),
-            if (_alarm.isRinging)
-              Padding(
-                padding: const EdgeInsets.only(top: 8.0),
-                child: SizedBox(
-                  height: 40,
-                  child: OutlinedButton.icon(
-                    onPressed: () async {
-                      await _alarm.stop();
-                      if (mounted) setState(() {});
-                    },
-                    icon: const Icon(Icons.alarm_off),
-                    label: const Text('关闭提醒'),
-                    style: OutlinedButton.styleFrom(foregroundColor: Colors.red),
-                  ),
+            const SizedBox(height: 8),
+            SizedBox(
+              height: 48,
+              child: OutlinedButton.icon(
+                onPressed: () async {
+                  if (_alarm.isRinging) {
+                    await _alarm.stop();
+                    _appendLog('手动关闭闹铃');
+                  } else {
+                    final keyword = _config.keyword.isEmpty
+                        ? '测试'
+                        : _config.keyword;
+                    await _alarm.trigger(keyword: keyword, count: 0);
+                    _appendLog('手动试响闹铃 keyword=$keyword');
+                  }
+                  if (mounted) setState(() {});
+                },
+                icon: Icon(_alarm.isRinging ? Icons.alarm_off : Icons.alarm),
+                label: Text(_alarm.isRinging ? '关闭提醒' : '手动试响闹铃'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor:
+                      _alarm.isRinging ? Colors.red : Colors.deepOrange,
                 ),
               ),
+            ),
           ],
         ),
       ),
