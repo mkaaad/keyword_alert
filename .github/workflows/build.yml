@@ -45,37 +45,15 @@ jobs:
       - name: Build APK
         run: |
           set -euo pipefail
-          # Prefer flutter CLI (uses build/app/outputs/flutter-apk after build-dir redirect).
-          # Fall back to Gradle directly and collect any APK if Flutter's locator fails.
-          if ! flutter build apk --release; then
-            echo "::warning::flutter build apk reported failure; trying Gradle assembleRelease + APK discovery"
-            (cd android && ./gradlew :app:assembleRelease --stacktrace)
+          flutter build apk --release
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          if [ ! -f "$APK" ]; then
+            echo "Expected APK missing: $APK"
+            find build -name "*.apk" -type f 2>/dev/null || true
+            exit 1
           fi
-
-          echo "=== APK search ==="
-          find build android -name "*.apk" -type f 2>/dev/null || true
-
-          # Canonical path expected by Flutter tooling
-          if [ -f build/app/outputs/flutter-apk/app-release.apk ]; then
-            APK=build/app/outputs/flutter-apk/app-release.apk
-          else
-            APK=$(find build android -name "app-release.apk" -type f 2>/dev/null | head -1 || true)
-          fi
-          if [ -z "${APK:-}" ]; then
-            APK=$(find build android -name "*.apk" -type f 2>/dev/null | head -1 || true)
-          fi
-          [ -n "${APK:-}" ] || { echo "No APK produced"; exit 1; }
-
-          # Normalize to the canonical Flutter APK path (skip if already there).
-          DEST=build/app/outputs/flutter-apk/app-release.apk
-          mkdir -p "$(dirname "$DEST")"
-          SRC_REAL=$(realpath "$APK")
-          DEST_REAL=$(realpath -m "$DEST")
-          if [ "$SRC_REAL" != "$DEST_REAL" ]; then
-            cp -f "$APK" "$DEST"
-          fi
-          ls -lh "$DEST"
-          echo "APK_PATH=$DEST" >> "$GITHUB_ENV"
+          ls -lh "$APK"
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
 
       - name: Package Magisk module
         run: |
@@ -83,8 +61,7 @@ jobs:
           MODULE_DIR="magisk_module"
           mkdir -p "$MODULE_DIR/system/priv-app/KeywordAlert"
           APK="${APK_PATH:-build/app/outputs/flutter-apk/app-release.apk}"
-          [ -f "$APK" ] || APK=$(find build android -name "*.apk" -type f | head -1)
-          [ -n "$APK" ] && [ -f "$APK" ] || { echo "No APK found"; find build android -name "*.apk" -type f || true; exit 1; }
+          [ -f "$APK" ] || { echo "APK not found: $APK"; exit 1; }
           cp "$APK" "$MODULE_DIR/system/priv-app/KeywordAlert/KeywordAlert.apk"
           echo "Packaged APK: $APK ($(du -h "$MODULE_DIR/system/priv-app/KeywordAlert/KeywordAlert.apk" | cut -f1))"
           cd "$MODULE_DIR"
