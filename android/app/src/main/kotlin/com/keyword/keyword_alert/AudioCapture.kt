@@ -186,6 +186,18 @@ class AudioCapture {
         }
     }
 
+    private fun newAudioRecordBuilder(context: Context): AudioRecord.Builder {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                val ctor = AudioRecord.Builder::class.java.getConstructor(Context::class.java)
+                return ctor.newInstance(context)
+            } catch (e: Exception) {
+                AppLog.w("AudioRecord.Builder(Context) unavailable, falling back: $e")
+            }
+        }
+        return AudioRecord.Builder()
+    }
+
     fun stop() {
         isRunning.set(false)
         thread?.interrupt()
