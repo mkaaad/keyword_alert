@@ -28,7 +28,10 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platforms;android-34 build-tools;34.0.0 ndk;27.0.12077973'
+          packages: 'platforms;android-34 build-tools;34.0.0 ndk;27.0.12077973 cmake;3.22.1'
+
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses >/dev/null || true
 
       - name: Download model
         run: bash setup.sh
@@ -41,22 +44,46 @@ jobs:
 
       - name: Build APK
         run: |
-          flutter build apk --release
-          echo "Build output:"
-          find build -name "*.apk" -type f
+          set -euo pipefail
+          # Prefer flutter CLI (uses build/app/outputs/flutter-apk after build-dir redirect).
+          # Fall back to Gradle directly and collect any APK if Flutter's locator fails.
+          if ! flutter build apk --release; then
+            echo "::warning::flutter build apk reported failure; trying Gradle assembleRelease + APK discovery"
+            (cd android && ./gradlew :app:assembleRelease --stacktrace)
+          fi
+
+          echo "=== APK search ==="
+          find build android -name "*.apk" -type f 2>/dev/null || true
+
+          # Canonical path expected by Flutter tooling
+          if [ -f build/app/outputs/flutter-apk/app-release.apk ]; then
+            APK=build/app/outputs/flutter-apk/app-release.apk
+          else
+            APK=$(find build android -name "app-release.apk" -type f 2>/dev/null | head -1 || true)
+          fi
+          if [ -z "${APK:-}" ]; then
+            APK=$(find build android -name "*.apk" -type f 2>/dev/null | head -1 || true)
+          fi
+          [ -n "${APK:-}" ] || { echo "No APK produced"; exit 1; }
+
+          mkdir -p build/app/outputs/flutter-apk
+          cp -f "$APK" build/app/outputs/flutter-apk/app-release.apk
+          ls -lh build/app/outputs/flutter-apk/app-release.apk
+          echo "APK_PATH=build/app/outputs/flutter-apk/app-release.apk" >> "$GITHUB_ENV"
 
       - name: Package Magisk module
         run: |
+          set -euo pipefail
           MODULE_DIR="magisk_module"
           mkdir -p "$MODULE_DIR/system/priv-app/KeywordAlert"
-          APK=$(find build -name "*.apk" -path "*/release/*" | head -1)
-          [ -z "$APK" ] && APK=$(find build -name "*.apk" | head -1)
-          [ -z "$APK" ] && { echo "No APK found"; find build -name "*.apk" -type f; exit 1; }
+          APK="${APK_PATH:-build/app/outputs/flutter-apk/app-release.apk}"
+          [ -f "$APK" ] || APK=$(find build android -name "*.apk" -type f | head -1)
+          [ -n "$APK" ] && [ -f "$APK" ] || { echo "No APK found"; find build android -name "*.apk" -type f || true; exit 1; }
           cp "$APK" "$MODULE_DIR/system/priv-app/KeywordAlert/KeywordAlert.apk"
+          echo "Packaged APK: $APK ($(du -h "$MODULE_DIR/system/priv-app/KeywordAlert/KeywordAlert.apk" | cut -f1))"
           cd "$MODULE_DIR"
           zip -r ../keyword_alert_magisk.zip . -x "*.DS_Store"
           cd ..
-          echo "ZIP_SIZE=$(du -h keyword_alert_magisk.zip | cut -f1)" >> "$GITHUB_ENV"
           ls -lh keyword_alert_magisk.zip
 
       - name: Create Release
