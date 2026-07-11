@@ -10,4 +10,10 @@ local.properties
 *.ap_
 *.aab
 *.zip
+# Large ASR model files (download via setup.sh)
+assets/models/*.onnx
+assets/models/tokens.txt
+!assets/models/.gitkeep
+.dart_tool/
+*.iml
 

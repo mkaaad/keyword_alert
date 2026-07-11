@@ -10,4 +10,20 @@ class MonitorConfig {
   });
 
   factory MonitorConfig.defaultConfig() => const MonitorConfig();
+
+  MonitorConfig copyWith({
+    String? keyword,
+    int? threshold,
+    Duration? window,
+  }) {
+    return MonitorConfig(
+      keyword: keyword ?? this.keyword,
+      threshold: threshold ?? this.threshold,
+      window: window ?? this.window,
+    );
+  }
+
+  @override
+  String toString() =>
+      'MonitorConfig(keyword: $keyword, threshold: $threshold, window: ${window.inSeconds}s)';
 }

@@ -11,8 +11,14 @@ import io.flutter.plugin.common.MethodChannel
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : FlutterActivity() {
+    companion object {
+        private const val TAG = "KeywordAlert"
+    }
+
     private var audioCapture: AudioCapture? = null
     private var asrStreamHandler: AsrStreamHandler? = null
+    /** Kept across start/stop so EventChannel re-use still delivers results. */
+    private var eventSink: EventChannel.EventSink? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -28,14 +34,13 @@ class MainActivity : FlutterActivity() {
                             val ok = startCaptureWithRoot()
                             runOnUiThread { result.success(ok) }
                         } catch (e: Exception) {
-                            Log.e("KeywordAlert", "startCapture failed", e)
+                            Log.e(TAG, "startCapture failed", e)
                             runOnUiThread { result.success(false) }
                         }
                     }.start()
                 }
                 "stopCapture" -> {
-                    audioCapture?.stop()
-                    asrStreamHandler?.stop()
+                    stopCapture()
                     result.success(true)
                 }
                 "isActive" -> result.success(audioCapture?.isActive() ?: false)
@@ -48,43 +53,71 @@ class MainActivity : FlutterActivity() {
             "com.keyword/asr_stream"
         ).setStreamHandler(object : EventChannel.StreamHandler {
             override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                eventSink = events
                 asrStreamHandler?.setSink(events)
             }
+
             override fun onCancel(arguments: Any?) {
-                asrStreamHandler?.stop()
+                // Do not stop capture here — Flutter may cancel when no active listeners.
+                // Only detach the sink so we don't send events to a disposed channel.
+                asrStreamHandler?.setSink(null)
+                eventSink = null
             }
         })
     }
 
     private fun startCaptureWithRoot(): Boolean {
-        Log.i("KeywordAlert", "Requesting root...")
+        // Stop previous session cleanly before starting a new one
+        stopCapture()
+
+        Log.i(TAG, "Requesting root...")
         if (!execSu("id")) {
-            Log.e("KeywordAlert", "Root denied")
+            Log.e(TAG, "Root denied")
             return false
         }
-        Log.i("KeywordAlert", "Root granted")
+        Log.i(TAG, "Root granted")
         val pkg = packageName
         execSu("pm grant $pkg android.permission.RECORD_AUDIO")
         execSu("pm grant $pkg android.permission.CAPTURE_AUDIO_OUTPUT")
-        audioCapture = AudioCapture()
-        val ok = audioCapture!!.start()
-        if (ok) asrStreamHandler = AsrStreamHandler(audioCapture!!, this@MainActivity)
-        Log.i("KeywordAlert", if (ok) "AudioCapture started" else "AudioCapture failed")
-        return ok
+        execSu("pm grant $pkg android.permission.POST_NOTIFICATIONS")
+
+        val capture = AudioCapture()
+        val ok = capture.start()
+        if (!ok) {
+            Log.e(TAG, "AudioCapture failed")
+            return false
+        }
+        audioCapture = capture
+        val handler = AsrStreamHandler(capture, this@MainActivity)
+        asrStreamHandler = handler
+        // Re-attach existing EventChannel sink (important for restart)
+        handler.setSink(eventSink)
+        // If Dart already has a subscription, start ASR immediately
+        if (eventSink != null) {
+            handler.start()
+        }
+        Log.i(TAG, "AudioCapture started")
+        return true
+    }
+
+    private fun stopCapture() {
+        asrStreamHandler?.stop()
+        asrStreamHandler = null
+        audioCapture?.stop()
+        audioCapture = null
     }
 
     private fun execSu(command: String): Boolean {
         return try {
             Runtime.getRuntime().exec(arrayOf("su", "-c", command)).waitFor() == 0
         } catch (e: Exception) {
-            Log.w("KeywordAlert", "su failed: $command", e)
+            Log.w(TAG, "su failed: $command", e)
             false
         }
     }
 
     override fun onDestroy() {
-        audioCapture?.stop()
-        asrStreamHandler?.stop()
+        stopCapture()
         super.onDestroy()
     }
 }
@@ -94,6 +127,7 @@ class AudioCapture {
         const val SAMPLE_RATE = 16000
         const val CHANNEL = AudioFormat.CHANNEL_IN_MONO
         const val ENCODING = AudioFormat.ENCODING_PCM_16BIT
+        private const val TAG = "KeywordAlert"
     }
 
     private var audioRecord: AudioRecord? = null
@@ -105,38 +139,44 @@ class AudioCapture {
     fun start(): Boolean {
         if (isRunning.get()) return true
         val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, ENCODING)
+        if (minBuf == AudioRecord.ERROR || minBuf == AudioRecord.ERROR_BAD_VALUE) {
+            Log.e(TAG, "Invalid min buffer size: $minBuf")
+            return false
+        }
         val bufSize = maxOf(minBuf, SAMPLE_RATE * 2)
 
         audioRecord = try {
-            Log.i("KeywordAlert", "Trying REMOTE_SUBMIX (source=7)...")
+            Log.i(TAG, "Trying REMOTE_SUBMIX (source=7)...")
             AudioRecord.Builder()
-                .setAudioSource(7)
-                .setAudioFormat(AudioFormat.Builder()
-                    .setEncoding(ENCODING).setSampleRate(SAMPLE_RATE).setChannelMask(CHANNEL).build())
+                .setAudioSource(7) // MediaRecorder.AudioSource.REMOTE_SUBMIX
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(ENCODING)
+                        .setSampleRate(SAMPLE_RATE)
+                        .setChannelMask(CHANNEL)
+                        .build()
+                )
                 .setBufferSizeInBytes(bufSize)
                 .build()
         } catch (e: Exception) {
-            Log.w("KeywordAlert", "REMOTE_SUBMIX failed, trying DEFAULT", e)
-            try {
-                AudioRecord.Builder()
-                    .setAudioSource(android.media.MediaRecorder.AudioSource.DEFAULT)
-                    .setAudioFormat(AudioFormat.Builder()
-                        .setEncoding(ENCODING).setSampleRate(SAMPLE_RATE).setChannelMask(CHANNEL).build())
-                    .setBufferSizeInBytes(bufSize)
-                    .build()
-            } catch (e2: Exception) {
-                Log.e("KeywordAlert", "All AudioRecord failed", e2); null
-            }
+            Log.w(TAG, "REMOTE_SUBMIX failed, trying UNPROCESSED/DEFAULT", e)
+            tryCreateFallbackRecord(bufSize)
         }
 
         if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-            Log.e("KeywordAlert", "AudioRecord not init, state=${audioRecord?.state}")
-            audioRecord?.release(); audioRecord = null; return false
+            Log.e(TAG, "AudioRecord not init, state=${audioRecord?.state}")
+            audioRecord?.release()
+            audioRecord = null
+            return false
         }
 
-        try { audioRecord!!.startRecording() } catch (e: Exception) {
-            Log.e("KeywordAlert", "startRecording failed", e)
-            audioRecord?.release(); audioRecord = null; return false
+        try {
+            audioRecord!!.startRecording()
+        } catch (e: Exception) {
+            Log.e(TAG, "startRecording failed", e)
+            audioRecord?.release()
+            audioRecord = null
+            return false
         }
 
         isRunning.set(true)
@@ -146,17 +186,75 @@ class AudioCapture {
             while (isRunning.get()) {
                 val read = audioRecord?.read(buf, 0, buf.size) ?: -1
                 if (read > 0) {
-                    synchronized(audioBuffer) { for (i in 0 until read) audioBuffer.add(buf[i]) }
+                    synchronized(audioBuffer) {
+                        for (i in 0 until read) audioBuffer.add(buf[i])
+                    }
                     hasNewData = true
+                } else if (read < 0) {
+                    Log.w(TAG, "AudioRecord.read error: $read")
+                    try {
+                        Thread.sleep(50)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
                 }
             }
-        }.apply { name = "AudioCapture"; start() }
+        }.apply {
+            name = "AudioCapture"
+            start()
+        }
         return true
     }
 
+    private fun tryCreateFallbackRecord(bufSize: Int): AudioRecord? {
+        val sources = listOf(
+            android.media.MediaRecorder.AudioSource.UNPROCESSED,
+            android.media.MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            android.media.MediaRecorder.AudioSource.DEFAULT,
+            android.media.MediaRecorder.AudioSource.MIC,
+        )
+        for (source in sources) {
+            try {
+                val record = AudioRecord.Builder()
+                    .setAudioSource(source)
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(ENCODING)
+                            .setSampleRate(SAMPLE_RATE)
+                            .setChannelMask(CHANNEL)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(bufSize)
+                    .build()
+                if (record.state == AudioRecord.STATE_INITIALIZED) {
+                    Log.i(TAG, "Fallback AudioRecord source=$source OK")
+                    return record
+                }
+                record.release()
+            } catch (e: Exception) {
+                Log.w(TAG, "Fallback source=$source failed", e)
+            }
+        }
+        return null
+    }
+
     fun stop() {
-        isRunning.set(false); thread?.interrupt(); thread = null
-        audioRecord?.apply { stop(); release() }; audioRecord = null
+        isRunning.set(false)
+        thread?.interrupt()
+        try {
+            thread?.join(1000)
+        } catch (_: InterruptedException) {
+        }
+        thread = null
+        try {
+            audioRecord?.stop()
+        } catch (_: Exception) {
+        }
+        try {
+            audioRecord?.release()
+        } catch (_: Exception) {
+        }
+        audioRecord = null
         synchronized(audioBuffer) { audioBuffer.clear() }
     }
 

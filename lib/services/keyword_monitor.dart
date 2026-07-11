@@ -27,7 +27,12 @@ class KeywordMonitor {
 
   MonitorConfig get config => _config;
   List<KeywordHit> get recentHits => List.unmodifiable(_hitLog);
-  int get currentCount { _expireOldHits(); return _hitTimestamps.length; }
+
+  /// Number of hits still inside the sliding time window.
+  int get currentCount {
+    _expireOldHits();
+    return _hitTimestamps.length;
+  }
 
   void _expireOldHits() {
     final cutoff = DateTime.now().subtract(_config.window);
@@ -36,32 +41,51 @@ class KeywordMonitor {
     }
   }
 
+  /// Feed one ASR text segment. Returns true if the threshold was just crossed.
   bool feed(String text) {
+    if (text.isEmpty || _config.keyword.isEmpty) return false;
     if (!text.contains(_config.keyword)) return false;
+
     _expireOldHits();
     final now = DateTime.now();
-    _hitTimestamps.add(now);
-    _hitLog.add(KeywordHit(
-      keyword: _config.keyword,
-      context: _extractContext(text),
-      timestamp: now,
-    ));
-    onHit?.call(_hitLog.last);
-    if (_hitTimestamps.length >= _config.threshold) {
+
+    // Count every non-overlapping occurrence in this segment.
+    var from = 0;
+    var added = 0;
+    while (true) {
+      final idx = text.indexOf(_config.keyword, from);
+      if (idx < 0) break;
+      _hitTimestamps.add(now);
+      _hitLog.add(KeywordHit(
+        keyword: _config.keyword,
+        context: _extractContext(text, idx),
+        timestamp: now,
+      ));
+      onHit?.call(_hitLog.last);
+      added++;
+      from = idx + _config.keyword.length;
+    }
+    if (added == 0) return false;
+
+    final count = _hitTimestamps.length;
+    if (count >= _config.threshold) {
       _hitTimestamps.clear();
-      onTrigger?.call(_config, _hitLog.length);
+      onTrigger?.call(_config, count);
       return true;
     }
     return false;
   }
 
-  String _extractContext(String text) {
-    final idx = text.indexOf(_config.keyword);
+  String _extractContext(String text, [int? index]) {
+    final idx = index ?? text.indexOf(_config.keyword);
     if (idx < 0) return text;
     final start = (idx - 10).clamp(0, text.length);
     final end = (idx + _config.keyword.length + 10).clamp(0, text.length);
     return text.substring(start, end);
   }
 
-  void reset() { _hitTimestamps.clear(); _hitLog.clear(); }
+  void reset() {
+    _hitTimestamps.clear();
+    _hitLog.clear();
+  }
 }

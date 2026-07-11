@@ -1,7 +1,7 @@
 #!/system/bin/sh
 
 ui_print "=== Keyword Alert ==="
-ui_print "  version: v1.9"
+ui_print "  version: v2.0"
 
 APK_PATH="$MODPATH/system/priv-app/KeywordAlert/KeywordAlert.apk"
 if [ -f "$APK_PATH" ]; then

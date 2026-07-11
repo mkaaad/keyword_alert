@@ -33,24 +33,44 @@ jobs:
       - name: Download model
         run: bash setup.sh
 
+      - name: Analyze & test
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+
       - name: Build APK
-        run: flutter build apk --release
+        run: |
+          flutter build apk --release
+          echo "Build output:"
+          find build -name "*.apk" -type f
 
       - name: Package Magisk module
         run: |
           MODULE_DIR="magisk_module"
           mkdir -p "$MODULE_DIR/system/priv-app/KeywordAlert"
-          APK=$(find build/app/outputs/apk/release -name "app-release.apk" | head -1)
+          APK=$(find build -name "*.apk" -path "*/release/*" | head -1)
+          [ -z "$APK" ] && APK=$(find build -name "*.apk" | head -1)
+          [ -z "$APK" ] && { echo "No APK found"; find build -name "*.apk" -type f; exit 1; }
           cp "$APK" "$MODULE_DIR/system/priv-app/KeywordAlert/KeywordAlert.apk"
           cd "$MODULE_DIR"
           zip -r ../keyword_alert_magisk.zip . -x "*.DS_Store"
           cd ..
           echo "ZIP_SIZE=$(du -h keyword_alert_magisk.zip | cut -f1)" >> "$GITHUB_ENV"
+          ls -lh keyword_alert_magisk.zip
 
       - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: keyword_alert_magisk.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Magisk zip (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: keyword_alert_magisk
+          path: keyword_alert_magisk.zip

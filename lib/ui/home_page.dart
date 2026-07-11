@@ -1,10 +1,14 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
 import '../models/monitor_config.dart';
-import '../services/keyword_monitor.dart';
 import '../services/alarm_service.dart';
 import '../services/audio_capture.dart';
+import '../services/background_task.dart';
+import '../services/keyword_monitor.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -13,7 +17,7 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
+class _HomePageState extends State<HomePage> {
   final AudioCaptureService _audioCapture = AudioCaptureService();
   final AlarmService _alarm = AlarmService();
 
@@ -28,46 +32,79 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
     _loadConfig();
     _alarm.initialize();
-    FlutterForegroundTask.initCommunicationPort();
+    _initForegroundTask();
   }
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _audioCapture.stop();
+    unawaited(_audioCapture.dispose());
+    unawaited(_alarm.stop());
+    _alarm.dispose();
     super.dispose();
   }
 
-  Future<void> _loadConfig() async {
-    final prefs = await SharedPreferences.getInstance();
-    final keyword = prefs.getString('keyword') ?? '老师';
-    final threshold = prefs.getInt('threshold') ?? 3;
-    final windowSeconds = prefs.getInt('windowSeconds') ?? 60;
-    setState(() {
-      _config = MonitorConfig(
-        keyword: keyword,
-        threshold: threshold,
-        window: Duration(seconds: windowSeconds),
+  void _initForegroundTask() {
+    try {
+      FlutterForegroundTask.init(
+        androidNotificationOptions: AndroidNotificationOptions(
+          channelId: 'keyword_alert_fg',
+          channelName: '关键词监控服务',
+          channelDescription: '后台监控运行时显示的通知',
+          onlyAlertOnce: true,
+        ),
+        iosNotificationOptions: const IOSNotificationOptions(
+          showNotification: false,
+          playSound: false,
+        ),
+        foregroundTaskOptions: ForegroundTaskOptions(
+          eventAction: ForegroundTaskEventAction.repeat(15000),
+          autoRunOnBoot: false,
+          autoRunOnMyPackageReplaced: false,
+          allowWakeLock: true,
+          allowWifiLock: false,
+        ),
       );
-      _createMonitor();
-    });
+    } catch (e) {
+      debugPrint('FlutterForegroundTask.init failed: $e');
+    }
+  }
+
+  Future<void> _loadConfig() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final keyword = prefs.getString('keyword') ?? '老师';
+      final threshold = prefs.getInt('threshold') ?? 3;
+      final windowSeconds = prefs.getInt('windowSeconds') ?? 60;
+      if (!mounted) return;
+      setState(() {
+        _config = MonitorConfig(
+          keyword: keyword,
+          threshold: threshold.clamp(1, 100),
+          window: Duration(seconds: windowSeconds.clamp(5, 3600)),
+        );
+        _createMonitor();
+      });
+    } catch (e) {
+      debugPrint('Load config failed: $e');
+      if (!mounted) return;
+      setState(_createMonitor);
+    }
   }
 
   void _createMonitor() {
     _monitor = KeywordMonitor(
       config: _config,
       onHit: (hit) {
+        if (!mounted) return;
         setState(() {
-          _hitCount = _monitor!.recentHits.length;
-          _recentTexts.insert(0, '${hit.timestamp.toString().substring(11, 19)} ${hit.context}');
-          if (_recentTexts.length > 20) _recentTexts.removeLast();
+          _hitCount = _monitor?.currentCount ?? 0;
         });
       },
-      onTrigger: (config, count) {
-        _alarm.trigger(keyword: config.keyword, count: count);
+      onTrigger: (config, count) async {
+        await _alarm.trigger(keyword: config.keyword, count: count);
+        if (mounted) setState(() {});
       },
     );
   }
@@ -75,63 +112,95 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Future<void> _toggleMonitoring() async {
     if (_isMonitoring) {
       await _audioCapture.stop();
-      await FlutterForegroundTask.stopService();
-      setState(() => _isMonitoring = false);
-    } else {
-      setState(() => _isStarting = true);
-      final ok = await _audioCapture.start();
-      if (!ok) {
-        if (mounted) {
-          setState(() => _isStarting = false);
-          showDialog(
-            context: context,
-            builder: (ctx) => AlertDialog(
-              title: const Text('启动失败'),
-              content: const Text('音频捕获启动失败，请检查 Magisk 模块是否安装并授予 Root 权限。\n\n'
-                  '可能原因：\n1. 未授予 Root 权限\n'
-                  '2. REMOTE_SUBMIX 未注入\n'
-                  '3. 设备不支持系统音频捕获'),
-              actions: [
-                FilledButton(onPressed: () => Navigator.pop(ctx), child: const Text('知道了')),
-              ],
-            ),
-          );
-        }
-        return;
+      try {
+        await FlutterForegroundTask.stopService();
+      } catch (e) {
+        debugPrint('stopService failed: $e');
       }
-      _monitor?.reset();
-      _createMonitor();
-      _audioCapture.asrStream.listen((text) {
+      if (!mounted) return;
+      setState(() {
+        _isMonitoring = false;
+        _lastText = '已停止';
+      });
+      return;
+    }
+
+    setState(() => _isStarting = true);
+    final ok = await _audioCapture.start();
+    if (!ok) {
+      if (mounted) {
+        setState(() => _isStarting = false);
+        await showDialog<void>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('启动失败'),
+            content: const Text(
+              '音频捕获启动失败，请检查 Magisk 模块是否安装并授予 Root 权限。\n\n'
+              '可能原因：\n'
+              '1. 未授予 Root 权限\n'
+              '2. REMOTE_SUBMIX 未注入\n'
+              '3. 设备不支持系统音频捕获\n'
+              '4. ASR 模型未正确打包',
+            ),
+            actions: [
+              FilledButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('知道了'),
+              ),
+            ],
+          ),
+        );
+      }
+      return;
+    }
+
+    _monitor?.reset();
+    _createMonitor();
+    _audioCapture.listen(
+      (text) {
+        if (!mounted) return;
         setState(() {
           _lastText = text;
           _recentTexts.insert(0, text);
           if (_recentTexts.length > 50) _recentTexts.removeLast();
         });
         _monitor?.feed(text);
-      });
+      },
+      onError: (e) {
+        debugPrint('ASR error: $e');
+        if (mounted) {
+          setState(() => _lastText = '识别出错: $e');
+        }
+      },
+    );
+
+    try {
       await FlutterForegroundTask.startService(
         notificationTitle: '关键词监控运行中',
-        notificationText: '正在监听"${_config.keyword}"',
-        callback: _backgroundTaskCallback,
+        notificationText: '正在监听「${_config.keyword}」',
+        callback: backgroundTaskCallback,
       );
-      setState(() {
-        _isMonitoring = true;
-        _isStarting = false;
-        _hitCount = 0;
-        _recentTexts.clear();
-      });
+    } catch (e) {
+      debugPrint('startService failed: $e');
     }
-  }
 
-  @pragma('vm:entry-point')
-  static Future<void> _backgroundTaskCallback() async {
-    FlutterForegroundTask.setTaskHandler(BackgroundTaskHandler());
+    if (!mounted) return;
+    setState(() {
+      _isMonitoring = true;
+      _isStarting = false;
+      _hitCount = 0;
+      _recentTexts.clear();
+      _lastText = '等待识别...';
+    });
   }
 
   Future<void> _showConfigDialog() async {
     final keywordCtrl = TextEditingController(text: _config.keyword);
-    final thresholdCtrl = TextEditingController(text: _config.threshold.toString());
-    final windowCtrl = TextEditingController(text: _config.window.inSeconds.toString());
+    final thresholdCtrl =
+        TextEditingController(text: _config.threshold.toString());
+    final windowCtrl =
+        TextEditingController(text: _config.window.inSeconds.toString());
+
     final result = await showDialog<Map<String, String>>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -139,125 +208,208 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            TextField(controller: keywordCtrl, decoration: const InputDecoration(labelText: '关键词')),
-            TextField(controller: thresholdCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: '触发阈值（次）')),
-            TextField(controller: windowCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: '时间窗口（秒）')),
+            TextField(
+              controller: keywordCtrl,
+              decoration: const InputDecoration(labelText: '关键词'),
+            ),
+            TextField(
+              controller: thresholdCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: '触发阈值（次）'),
+            ),
+            TextField(
+              controller: windowCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: '时间窗口（秒）'),
+            ),
           ],
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, {'keyword': keywordCtrl.text, 'threshold': thresholdCtrl.text, 'window': windowCtrl.text}), child: const Text('保存')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, {
+              'keyword': keywordCtrl.text.trim(),
+              'threshold': thresholdCtrl.text.trim(),
+              'window': windowCtrl.text.trim(),
+            }),
+            child: const Text('保存'),
+          ),
         ],
       ),
     );
-    if (result != null) {
+
+    keywordCtrl.dispose();
+    thresholdCtrl.dispose();
+    windowCtrl.dispose();
+
+    if (result == null || !mounted) return;
+
+    final keyword = result['keyword'] ?? '';
+    if (keyword.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('关键词不能为空')),
+      );
+      return;
+    }
+
+    final threshold = int.tryParse(result['threshold'] ?? '');
+    final window = int.tryParse(result['window'] ?? '');
+    if (threshold == null || threshold < 1 || window == null || window < 5) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('阈值需 ≥1，时间窗口需 ≥5 秒')),
+      );
+      return;
+    }
+
+    try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('keyword', result['keyword']!);
-      await prefs.setInt('threshold', int.parse(result['threshold']!));
-      await prefs.setInt('windowSeconds', int.parse(result['window']!));
+      await prefs.setString('keyword', keyword);
+      await prefs.setInt('threshold', threshold.clamp(1, 100));
+      await prefs.setInt('windowSeconds', window.clamp(5, 3600));
       await _loadConfig();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('保存失败: $e')),
+        );
+      }
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      home: Scaffold(
-        appBar: AppBar(
-          title: const Text('关键词监控'),
-          actions: [
-            IconButton(
-              icon: const Icon(Icons.settings),
-              onPressed: _isMonitoring ? null : _showConfigDialog,
-            ),
-          ],
-        ),
-        body: Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(16.0),
-                  child: Column(
-                    children: [
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          Text(_isMonitoring ? '🟢 监控中' : '⚪ 已停止', style: Theme.of(context).textTheme.titleMedium),
-                          Text('关键词: "${_config.keyword}"', style: Theme.of(context).textTheme.bodyMedium),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceAround,
-                        children: [
-                          _StatBox(label: '阈值', value: '${_config.threshold}次'),
-                          _StatBox(label: '窗口', value: '${_config.window.inSeconds}秒'),
-                          _StatBox(label: '命中', value: '$_hitCount'),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              const SizedBox(height: 12),
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(12.0),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('最新识别:', style: Theme.of(context).textTheme.labelMedium),
-                      const SizedBox(height: 4),
-                      Text(_lastText, style: Theme.of(context).textTheme.bodyLarge),
-                    ],
-                  ),
-                ),
-              ),
-              const SizedBox(height: 12),
-              Expanded(
-                child: Card(
-                  child: ListView.builder(
-                    itemCount: _recentTexts.length,
-                    itemBuilder: (_, i) => Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 2.0),
-                      child: Text(_recentTexts[i], style: Theme.of(context).textTheme.bodySmall),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 16),
-              SizedBox(
-                height: 56,
-                child: FilledButton.icon(
-                  onPressed: _isStarting ? null : _toggleMonitoring,
-                  icon: _isStarting
-                      ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                      : Icon(_isMonitoring ? Icons.stop : Icons.play_arrow),
-                  label: Text(_isStarting ? '启动中...' : (_isMonitoring ? '停止监控' : '开始监控')),
-                  style: FilledButton.styleFrom(
-                    backgroundColor: _isMonitoring ? Colors.red : Colors.green,
-                  ),
-                ),
-              ),
-              if (_alarm.isRinging)
-                Padding(
-                  padding: const EdgeInsets.only(top: 8.0),
-                  child: SizedBox(
-                    height: 40,
-                    child: OutlinedButton.icon(
-                      onPressed: () { _alarm.stop(); setState(() {}); },
-                      icon: const Icon(Icons.alarm_off),
-                      label: const Text('关闭提醒'),
-                      style: OutlinedButton.styleFrom(foregroundColor: Colors.red),
-                    ),
-                  ),
-                ),
-            ],
+    final theme = Theme.of(context);
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('关键词监控'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            onPressed: _isMonitoring ? null : _showConfigDialog,
           ),
+        ],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(
+                          _isMonitoring ? '🟢 监控中' : '⚪ 已停止',
+                          style: theme.textTheme.titleMedium,
+                        ),
+                        Text(
+                          '关键词: "${_config.keyword}"',
+                          style: theme.textTheme.bodyMedium,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceAround,
+                      children: [
+                        _StatBox(label: '阈值', value: '${_config.threshold}次'),
+                        _StatBox(
+                          label: '窗口',
+                          value: '${_config.window.inSeconds}秒',
+                        ),
+                        _StatBox(label: '命中', value: '$_hitCount'),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('最新识别:', style: theme.textTheme.labelMedium),
+                    const SizedBox(height: 4),
+                    Text(_lastText, style: theme.textTheme.bodyLarge),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: Card(
+                child: _recentTexts.isEmpty
+                    ? Center(
+                        child: Text(
+                          '识别记录将显示在这里',
+                          style: theme.textTheme.bodySmall,
+                        ),
+                      )
+                    : ListView.builder(
+                        padding: const EdgeInsets.all(8),
+                        itemCount: _recentTexts.length,
+                        itemBuilder: (_, i) => Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 2.0),
+                          child: Text(
+                            _recentTexts[i],
+                            style: theme.textTheme.bodySmall,
+                          ),
+                        ),
+                      ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            SizedBox(
+              height: 56,
+              child: FilledButton.icon(
+                onPressed: _isStarting ? null : _toggleMonitoring,
+                icon: _isStarting
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      )
+                    : Icon(_isMonitoring ? Icons.stop : Icons.play_arrow),
+                label: Text(
+                  _isStarting
+                      ? '启动中...'
+                      : (_isMonitoring ? '停止监控' : '开始监控'),
+                ),
+                style: FilledButton.styleFrom(
+                  backgroundColor: _isMonitoring ? Colors.red : Colors.green,
+                ),
+              ),
+            ),
+            if (_alarm.isRinging)
+              Padding(
+                padding: const EdgeInsets.only(top: 8.0),
+                child: SizedBox(
+                  height: 40,
+                  child: OutlinedButton.icon(
+                    onPressed: () async {
+                      await _alarm.stop();
+                      if (mounted) setState(() {});
+                    },
+                    icon: const Icon(Icons.alarm_off),
+                    label: const Text('关闭提醒'),
+                    style: OutlinedButton.styleFrom(foregroundColor: Colors.red),
+                  ),
+                ),
+              ),
+          ],
         ),
       ),
     );
@@ -268,6 +420,7 @@ class _StatBox extends StatelessWidget {
   final String label;
   final String value;
   const _StatBox({required this.label, required this.value});
+
   @override
   Widget build(BuildContext context) {
     return Column(
@@ -277,13 +430,4 @@ class _StatBox extends StatelessWidget {
       ],
     );
   }
-}
-
-class BackgroundTaskHandler extends TaskHandler {
-  @override
-  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {}
-  @override
-  void onRepeatEvent(DateTime timestamp) {}
-  @override
-  Future<void> onDestroy(DateTime timestamp) async {}
 }
