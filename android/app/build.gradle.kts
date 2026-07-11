@@ -29,7 +29,17 @@ android {
 
     buildTypes {
         release {
+            // Keep code for sherpa-onnx JNI field access (decodingMethod, etc.)
+            isMinifyEnabled = false
+            isShrinkResources = false
             signingConfig = signingConfigs.getByName("debug")
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+        }
+        debug {
+            isMinifyEnabled = false
         }
     }
 }

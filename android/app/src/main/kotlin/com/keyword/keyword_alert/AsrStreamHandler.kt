@@ -114,19 +114,28 @@ class AsrStreamHandler(
                 val modelDir = ensureModelFiles()
                 val modelPath = File(modelDir, "model.int8.onnx").absolutePath
                 val tokensPath = File(modelDir, "tokens.txt").absolutePath
-                val config = OfflineRecognizerConfig(
-                    modelConfig = OfflineModelConfig(
-                        senseVoice = OfflineSenseVoiceModelConfig(
-                            model = modelPath,
-                            language = "zh",
-                            useInverseTextNormalization = true
-                        ),
-                        tokens = tokensPath,
-                        numThreads = 2,
-                        debug = false,
-                    )
-                )
-                recognizer = OfflineRecognizer(null, config)
+
+                // Build config with explicit fields. JNI uses GetFieldID on names
+                // like decodingMethod / modelConfig — must not be stripped by R8.
+                val senseVoice = OfflineSenseVoiceModelConfig().apply {
+                    model = modelPath
+                    language = "zh"
+                    useInverseTextNormalization = true
+                }
+                val modelConfig = OfflineModelConfig().apply {
+                    this.senseVoice = senseVoice
+                    tokens = tokensPath
+                    numThreads = 2
+                    debug = false
+                    provider = "cpu"
+                }
+                val config = OfflineRecognizerConfig().apply {
+                    this.modelConfig = modelConfig
+                    decodingMethod = "greedy_search"
+                    maxActivePaths = 4
+                }
+                Log.i(TAG, "Creating OfflineRecognizer model=$modelPath tokens=$tokensPath")
+                recognizer = OfflineRecognizer(assetManager = null, config = config)
                 Log.i(TAG, "OfflineRecognizer ready (SenseVoice)")
 
                 val samplesPerChunk = (SAMPLE_RATE * CHUNK_MS / 1000).toInt()
