@@ -360,194 +360,227 @@ class _HomePageState extends State<HomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(
-                          _isMonitoring
-                              ? (_captureMode.contains('ocr')
-                                  ? '🟢 $_captureMode'
-                                  : _captureMode == 'playback' ||
-                                          _captureMode == 'remote_submix'
-                                      ? '🟢 $_captureMode'
-                                      : '🟡 监控中·$_captureMode')
-                              : '⚪ 已停止',
-                          style: theme.textTheme.titleMedium,
-                        ),
-                        Text(
-                          '「${_config.keyword}」',
-                          style: theme.textTheme.bodyMedium,
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceAround,
-                      children: [
-                        _StatBox(label: '阈值', value: '${_config.threshold}次'),
-                        _StatBox(
-                          label: '窗口',
-                          value: '${_config.window.inSeconds}秒',
-                        ),
-                        _StatBox(label: '命中', value: '$_hitCount'),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Card(
-              child: SwitchListTile(
-                contentPadding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 0),
-                secondary: Icon(
-                  Icons.document_scanner_outlined,
-                  color: _ocrEnabled ? Colors.deepOrange : null,
-                ),
-                title: const Text('录屏识字（全屏 OCR）'),
-                subtitle: Text(
-                  _ocrEnabled
-                      ? '开启后截取整屏识别中文（字幕/聊天），约 1.5 秒一次'
-                      : '关闭时仅系统内录音频；会议建议打开',
-                  style: theme.textTheme.bodySmall,
-                ),
-                value: _ocrEnabled,
-                onChanged: _isMonitoring || _isStarting
-                    ? null
-                    : (v) => unawaited(_setOcrEnabled(v)),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(12.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('最新识别:', style: theme.textTheme.labelMedium),
-                    const SizedBox(height: 4),
-                    Text(_lastText, style: theme.textTheme.bodyLarge),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 8),
             Expanded(
-              flex: 2,
-              child: Card(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
-                      child: Row(
+              child: ListView(
+                children: [
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(16.0),
+                      child: Column(
                         children: [
-                          Text('识别记录', style: theme.textTheme.labelMedium),
-                          const Spacer(),
-                          Text(
-                            _recentTexts.isEmpty ? '暂无' : '${_recentTexts.length}条',
-                            style: theme.textTheme.labelSmall,
-                          ),
-                        ],
-                      ),
-                    ),
-                    Expanded(
-                      child: _recentTexts.isEmpty
-                          ? Center(
-                              child: Text(
-                                '有识别结果会显示在这里',
-                                style: theme.textTheme.bodySmall,
-                              ),
-                            )
-                          : ListView.builder(
-                              padding: const EdgeInsets.all(8),
-                              itemCount: _recentTexts.length,
-                              itemBuilder: (_, i) => Padding(
-                                padding: const EdgeInsets.symmetric(vertical: 2.0),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Flexible(
                                 child: Text(
-                                  _recentTexts[i],
-                                  style: theme.textTheme.bodySmall,
+                                  _isMonitoring
+                                      ? (_captureMode.contains('ocr')
+                                          ? '🟢 $_captureMode'
+                                          : _captureMode == 'playback' ||
+                                                  _captureMode == 'remote_submix'
+                                              ? '🟢 $_captureMode'
+                                              : '🟡 监控中·$_captureMode')
+                                      : '⚪ 已停止',
+                                  style: theme.textTheme.titleMedium,
+                                  overflow: TextOverflow.ellipsis,
                                 ),
                               ),
-                            ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Expanded(
-              flex: 3,
-              child: Card(
-                color: Colors.black87,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(8, 8, 4, 0),
-                      child: Row(
-                        children: [
-                          Text(
-                            '运行日志（无需 adb）',
-                            style: theme.textTheme.labelMedium?.copyWith(
-                              color: Colors.white70,
-                            ),
+                              Text(
+                                '「${_config.keyword}」',
+                                style: theme.textTheme.bodyMedium,
+                              ),
+                            ],
                           ),
-                          const Spacer(),
-                          TextButton(
-                            onPressed: () => setState(_debugLogs.clear),
-                            child: const Text('清空', style: TextStyle(fontSize: 12)),
+                          const SizedBox(height: 8),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceAround,
+                            children: [
+                              _StatBox(
+                                label: '次数',
+                                value: '${_config.threshold}次',
+                              ),
+                              _StatBox(
+                                label: '窗口',
+                                value: '${_config.window.inSeconds}秒',
+                              ),
+                              _StatBox(label: '命中', value: '$_hitCount'),
+                            ],
                           ),
                         ],
                       ),
                     ),
-                    Expanded(
-                      child: _debugLogs.isEmpty
-                          ? const Center(
-                              child: Text(
-                                '等待日志…',
-                                style: TextStyle(color: Colors.white38, fontSize: 12),
-                              ),
-                            )
-                          : ListView.builder(
-                              controller: _logScroll,
-                              padding: const EdgeInsets.all(8),
-                              itemCount: _debugLogs.length,
-                              itemBuilder: (_, i) {
-                                final line = _debugLogs[i];
-                                final color = line.contains(' E ')
-                                    ? Colors.redAccent
-                                    : line.contains(' W ')
-                                        ? Colors.orangeAccent
-                                        : line.contains('playback') ||
-                                                line.contains('ASR ok')
-                                            ? Colors.lightGreenAccent
-                                            : Colors.white70;
-                                return Text(
-                                  line,
-                                  style: TextStyle(
-                                    fontFamily: 'monospace',
-                                    fontSize: 10,
-                                    color: color,
-                                    height: 1.3,
-                                  ),
-                                );
-                              },
-                            ),
+                  ),
+                  const SizedBox(height: 8),
+                  Card(
+                    child: SwitchListTile(
+                      dense: true,
+                      visualDensity: VisualDensity.compact,
+                      contentPadding:
+                          const EdgeInsets.symmetric(horizontal: 12),
+                      secondary: Icon(
+                        Icons.document_scanner_outlined,
+                        color: _ocrEnabled ? Colors.deepOrange : null,
+                      ),
+                      title: const Text('录屏识字（全屏 OCR）'),
+                      subtitle: Text(
+                        _ocrEnabled
+                            ? '整屏中文 OCR，约 1.5s/次（字幕/聊天）'
+                            : '关=仅内录；会议建议打开',
+                        style: theme.textTheme.bodySmall,
+                      ),
+                      value: _ocrEnabled,
+                      onChanged: _isMonitoring || _isStarting
+                          ? null
+                          : (v) => unawaited(_setOcrEnabled(v)),
                     ),
-                  ],
-                ),
+                  ),
+                  const SizedBox(height: 8),
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(12.0),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text('最新识别:', style: theme.textTheme.labelMedium),
+                          const SizedBox(height: 4),
+                          Text(_lastText, style: theme.textTheme.bodyLarge),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    height: 140,
+                    child: Card(
+                      clipBehavior: Clip.hardEdge,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
+                            child: Row(
+                              children: [
+                                Text(
+                                  '识别记录',
+                                  style: theme.textTheme.labelMedium,
+                                ),
+                                const Spacer(),
+                                Text(
+                                  _recentTexts.isEmpty
+                                      ? '暂无'
+                                      : '${_recentTexts.length}条',
+                                  style: theme.textTheme.labelSmall,
+                                ),
+                              ],
+                            ),
+                          ),
+                          Expanded(
+                            child: _recentTexts.isEmpty
+                                ? Center(
+                                    child: Text(
+                                      '有识别结果会显示在这里',
+                                      style: theme.textTheme.bodySmall,
+                                    ),
+                                  )
+                                : ListView.builder(
+                                    padding: const EdgeInsets.all(8),
+                                    itemCount: _recentTexts.length,
+                                    itemBuilder: (_, i) => Padding(
+                                      padding: const EdgeInsets.symmetric(
+                                        vertical: 2.0,
+                                      ),
+                                      child: Text(
+                                        _recentTexts[i],
+                                        style: theme.textTheme.bodySmall,
+                                      ),
+                                    ),
+                                  ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    height: 200,
+                    child: Card(
+                      color: Colors.black87,
+                      clipBehavior: Clip.hardEdge,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(8, 8, 4, 0),
+                            child: Row(
+                              children: [
+                                Text(
+                                  '运行日志（无需 adb）',
+                                  style: theme.textTheme.labelMedium?.copyWith(
+                                    color: Colors.white70,
+                                  ),
+                                ),
+                                const Spacer(),
+                                TextButton(
+                                  onPressed: () => setState(_debugLogs.clear),
+                                  child: const Text(
+                                    '清空',
+                                    style: TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          Expanded(
+                            child: _debugLogs.isEmpty
+                                ? const Center(
+                                    child: Text(
+                                      '等待日志…',
+                                      style: TextStyle(
+                                        color: Colors.white38,
+                                        fontSize: 12,
+                                      ),
+                                    ),
+                                  )
+                                : ListView.builder(
+                                    controller: _logScroll,
+                                    padding: const EdgeInsets.all(8),
+                                    itemCount: _debugLogs.length,
+                                    itemBuilder: (_, i) {
+                                      final line = _debugLogs[i];
+                                      final color = line.contains(' E ')
+                                          ? Colors.redAccent
+                                          : line.contains(' W ')
+                                              ? Colors.orangeAccent
+                                              : line.contains('OCR') ||
+                                                      line.contains(
+                                                        'playback',
+                                                      ) ||
+                                                      line.contains('ASR ok')
+                                                  ? Colors.lightGreenAccent
+                                                  : Colors.white70;
+                                      return Text(
+                                        line,
+                                        style: TextStyle(
+                                          fontFamily: 'monospace',
+                                          fontSize: 10,
+                                          color: color,
+                                          height: 1.3,
+                                        ),
+                                      );
+                                    },
+                                  ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: 12),
             SizedBox(
-              height: 56,
+              height: 52,
               child: FilledButton.icon(
                 onPressed: _isStarting ? null : _toggleMonitoring,
                 icon: _isStarting
@@ -572,7 +605,7 @@ class _HomePageState extends State<HomePage> {
             ),
             const SizedBox(height: 8),
             SizedBox(
-              height: 48,
+              height: 44,
               child: OutlinedButton.icon(
                 onPressed: () async {
                   if (_alarm.isRinging) {
