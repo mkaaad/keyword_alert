@@ -13,7 +13,11 @@ class CaptureStartResult {
     this.error,
   });
 
-  bool get isPlayback => mode == 'playback';
+  /// True when any system-audio path is active (not mic).
+  bool get isPlayback =>
+      mode == 'playback' ||
+      mode == 'playback_voice' ||
+      mode == 'remote_submix';
 }
 
 class AudioCaptureService {

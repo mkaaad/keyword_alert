@@ -173,7 +173,7 @@ class CaptureForegroundService : Service() {
                     null,
                 )
                 currentProjection = projection
-                AppLog.i("VirtualDisplay OK — starting AudioPlaybackCapture on main thread")
+                AppLog.i("VirtualDisplay OK — starting capture (playback + optional REMOTE_SUBMIX)")
 
                 // Build AudioRecord HERE on main thread with Service context.
                 // Creating it later on a worker thread / without Context often fails with:
@@ -187,7 +187,7 @@ class CaptureForegroundService : Service() {
                     val capture = AudioCapture()
                     val audioOk = capture.startPlaybackOnly(this@CaptureForegroundService, projection)
                     if (!audioOk) {
-                        AppLog.e("AudioPlaybackCapture failed inside service")
+                        AppLog.e("All capture paths failed (playback + remote_submix)")
                         clearProjection()
                         ready = false
                         broadcastReady(false)
@@ -195,7 +195,10 @@ class CaptureForegroundService : Service() {
                     }
                     audioCapture = capture
                     ready = true
-                    AppLog.i("CaptureForegroundService: projection+audio ready mode=${capture.captureMode}")
+                    AppLog.i(
+                        "CaptureForegroundService: ready mode=${capture.captureMode} " +
+                            "(remote_submix better for 腾讯会议 VoIP)",
+                    )
                     broadcastReady(true)
                 }, 150)
             } catch (e: Exception) {

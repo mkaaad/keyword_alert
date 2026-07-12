@@ -176,8 +176,8 @@ class _HomePageState extends State<HomePage> {
               '请确认：\n'
               '1. 点了「立即开始」允许屏幕录制/投射\n'
               '2. 通知栏允许本应用前台服务\n'
-              '3. 使用含应用内日志的新版本\n'
-              '4. 看下方「运行日志」定位原因',
+              '3. 腾讯会议等走「通话/VoIP」音，请用 Magisk 模块安装（REMOTE_SUBMIX）\n'
+              '4. 看下方「运行日志」：mode=remote_submix 或 playback，以及 RMS',
             ),
             actions: [
               FilledButton(
