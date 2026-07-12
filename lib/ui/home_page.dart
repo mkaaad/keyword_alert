@@ -396,7 +396,7 @@ class _HomePageState extends State<HomePage> {
                             mainAxisAlignment: MainAxisAlignment.spaceAround,
                             children: [
                               _StatBox(
-                                label: '次数',
+                                label: '频次',
                                 value: '${_config.threshold}次',
                               ),
                               _StatBox(
