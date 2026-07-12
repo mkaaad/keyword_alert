@@ -222,8 +222,48 @@ class CaptureForegroundService : Service() {
                 }
                 AppLog.i("VirtualDisplay ${width}x${height} dpi=$density ocr=$enableOcr")
 
-                val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3)
+                // Prefer CPU-readable ImageReader so MediaProjection frames are deliverable.
+                val reader = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    try {
+                        ImageReader.newInstance(
+                            width,
+                            height,
+                            PixelFormat.RGBA_8888,
+                            4,
+                            android.hardware.HardwareBuffer.USAGE_CPU_READ_OFTEN or
+                                android.hardware.HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+                        )
+                    } catch (e: Exception) {
+                        AppLog.w("ImageReader usage flags failed, fallback: $e")
+                        ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 4)
+                    }
+                } else {
+                    ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 4)
+                }
                 imageReader = reader
+
+                // Start OCR listener BEFORE VirtualDisplay so we never miss the first frames.
+                var ocrOk = false
+                if (enableOcr) {
+                    val ocr = ScreenOcr { text ->
+                        val cbText = onOcrText
+                        if (cbText == null) {
+                            AppLog.w("OCR text dropped — no Flutter listener yet: ${text.take(40)}")
+                        } else {
+                            cbText.invoke(text)
+                        }
+                    }
+                    ocrOk = ocr.start(reader)
+                    if (ocrOk) {
+                        screenOcr = ocr
+                        AppLog.i("ScreenOcr listening BEFORE VirtualDisplay")
+                    } else {
+                        AppLog.e("ScreenOcr failed to start")
+                    }
+                } else {
+                    AppLog.i("ScreenOcr skipped (user disabled)")
+                }
+
                 // MediaProjection: AUTO_MIRROR only (PUBLIC often black/empty on ColorOS).
                 virtualDisplay = projection.createVirtualDisplay(
                     "keyword_alert_cap",
@@ -232,38 +272,29 @@ class CaptureForegroundService : Service() {
                     density,
                     DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                     reader.surface,
-                    null,
+                    object : VirtualDisplay.Callback() {
+                        override fun onPaused() {
+                            AppLog.w("VirtualDisplay.onPaused")
+                        }
+
+                        override fun onResumed() {
+                            AppLog.i("VirtualDisplay.onResumed")
+                        }
+
+                        override fun onStopped() {
+                            AppLog.w("VirtualDisplay.onStopped")
+                        }
+                    },
                     mainLooper,
                 )
                 currentProjection = projection
-                AppLog.i("VirtualDisplay OK — starting independent paths")
+                AppLog.i("VirtualDisplay OK surface=${reader.surface?.isValid}")
 
-                // Give the mirror a moment to paint before starting OCR.
+                // Audio + ready after short settle (OCR already running).
                 mainLooper.postDelayed({
                     if (currentProjection !== projection) {
                         AppLog.w("Projection changed before capture start — abort")
                         return@postDelayed
-                    }
-
-                    var ocrOk = false
-                    if (enableOcr) {
-                        val ocr = ScreenOcr { text ->
-                            val cbText = onOcrText
-                            if (cbText == null) {
-                                AppLog.w("OCR text dropped — no Flutter listener yet: ${text.take(40)}")
-                            } else {
-                                cbText.invoke(text)
-                            }
-                        }
-                        ocrOk = ocr.start(reader)
-                        if (ocrOk) {
-                            screenOcr = ocr
-                            AppLog.i("ScreenOcr path active (independent of audio)")
-                        } else {
-                            AppLog.e("ScreenOcr failed to start")
-                        }
-                    } else {
-                        AppLog.i("ScreenOcr skipped (user disabled)")
                     }
 
                     var audioMode = "none"

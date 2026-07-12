@@ -59,11 +59,13 @@ class ScreenOcr(
             startedAt = System.currentTimeMillis()
             lastOcrAt = 0L
             imageReader.setOnImageAvailableListener({ r ->
-                onImageAvailable(r)
+                onImageAvailable(r, from = "listener")
             }, workerHandler)
+            // ColorOS/MediaProjection sometimes never fires listener — poll as backup.
+            workerHandler?.post(pollRunnable)
             AppLog.i(
                 "ScreenOcr started size=${imageReader.width}x${imageReader.height} " +
-                    "interval=${OCR_INTERVAL_MS}ms",
+                    "interval=${OCR_INTERVAL_MS}ms (listener+poll)",
             )
             true
         } catch (e: Exception) {
@@ -73,22 +75,50 @@ class ScreenOcr(
         }
     }
 
-    private fun onImageAvailable(reader: ImageReader) {
+    private val pollRunnable: Runnable = object : Runnable {
+        override fun run() {
+            if (!running.get()) return
+            val r = reader
+            if (r != null) {
+                onImageAvailable(r, from = "poll")
+                if (frameCount == 0L && System.currentTimeMillis() - startedAt > 3000L) {
+                    AppLog.w(
+                        "OCR still no frames after 3s " +
+                            "(VirtualDisplay may not be delivering to ImageReader)",
+                    )
+                }
+            }
+            workerHandler?.postDelayed(this, 500L)
+        }
+    }
+
+    private fun onImageAvailable(reader: ImageReader, from: String) {
         var image: Image? = null
         try {
-            image = reader.acquireLatestImage() ?: return
+            image = reader.acquireLatestImage()
+            if (image == null) {
+                if (from == "poll" && frameCount == 0L &&
+                    System.currentTimeMillis() - startedAt > 1500L &&
+                    (System.currentTimeMillis() - startedAt).toInt() % 2000 < 600
+                ) {
+                    AppLog.w("OCR poll: acquireLatestImage=null (no frame yet)")
+                }
+                return
+            }
             frameCount++
+            if (frameCount == 1L) {
+                AppLog.i("OCR first frame via $from ${image.width}x${image.height}")
+            }
             if (!running.get()) return
 
             val now = System.currentTimeMillis()
-            // Wait ~400ms for VirtualDisplay to paint first frame
-            if (now - startedAt < 400L) return
             if (now - lastOcrAt < OCR_INTERVAL_MS) return
             if (!ocrBusy.compareAndSet(false, true)) return
             lastOcrAt = now
             ocrAttempts++
 
             val bitmap = imageToBitmap(image)
+            // close in finally below
             try {
                 image.close()
             } catch (_: Exception) {
@@ -96,7 +126,7 @@ class ScreenOcr(
             image = null
 
             if (bitmap == null) {
-                AppLog.w("OCR frame#$frameCount imageToBitmap=null")
+                AppLog.w("OCR frame#$frameCount imageToBitmap=null via=$from")
                 ocrBusy.set(false)
                 return
             }
@@ -290,6 +320,10 @@ class ScreenOcr(
     fun stop() {
         running.set(false)
         isActive = false
+        try {
+            workerHandler?.removeCallbacks(pollRunnable)
+        } catch (_: Exception) {
+        }
         try {
             reader?.setOnImageAvailableListener(null, null)
         } catch (_: Exception) {
