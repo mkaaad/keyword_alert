@@ -20,7 +20,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 class MainActivity : FlutterActivity() {
     companion object {
         private const val REQ_MEDIA_PROJECTION = 1001
-        private const val PROJECTION_WAIT_MS = 6000L
+        private const val REQ_RECORD_AUDIO = 1002
+        private const val PROJECTION_WAIT_MS = 8000L
     }
 
     private var audioCapture: AudioCapture? = null
@@ -34,6 +35,10 @@ class MainActivity : FlutterActivity() {
     private val handledProjection = AtomicBoolean(false)
     private var pendingOcrEnabled: Boolean = false
     private var pendingAudioEnabled: Boolean = true
+
+    /** Held after user accepts MediaProjection; service starts after optional RECORD_AUDIO. */
+    private var pendingProjectionResultCode: Int = 0
+    private var pendingProjectionData: Intent? = null
 
     private val projectionReadyReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -72,24 +77,35 @@ class MainActivity : FlutterActivity() {
         ).setMethodCallHandler { call, result ->
             when (call.method) {
                 "startCapture" -> {
+                    // Drop stale pending from crashed previous start so UI never sticks on busy.
                     if (pendingStartResult != null) {
-                        result.success(mapOf("ok" to false, "mode" to "none", "error" to "busy"))
-                        return@setMethodCallHandler
+                        AppLog.w("startCapture: clearing stale pending result (was busy)")
+                        try {
+                            pendingStartResult?.success(
+                                mapOf("ok" to false, "mode" to "none", "error" to "superseded"),
+                            )
+                        } catch (_: Exception) {
+                        }
+                        pendingStartResult = null
                     }
                     pendingStartResult = result
                     handledProjection.set(false)
+                    pendingProjectionData = null
+                    pendingProjectionResultCode = 0
+
                     val args = call.arguments as? Map<*, *>
-                    pendingOcrEnabled = args?.get("ocrEnabled") == true
-                    // Default audio on unless explicitly false
-                    pendingAudioEnabled = args?.get("audioEnabled") != false
+                    pendingOcrEnabled = truthy(args?.get("ocrEnabled"))
+                    pendingAudioEnabled = truthy(args?.get("audioEnabled"), defaultTrue = true)
                     if (!pendingOcrEnabled && !pendingAudioEnabled) {
                         finishStart(ok = false, mode = "none", error = "nothing_enabled")
                         return@setMethodCallHandler
                     }
                     AppLog.i(
-                        "startCapture ocr=$pendingOcrEnabled audio=$pendingAudioEnabled",
+                        "startCapture ocr=$pendingOcrEnabled audio=$pendingAudioEnabled " +
+                            "— launching MediaProjection FIRST",
                     )
-                    requestCapturePermissionOrStart()
+                    // ALWAYS show system screen-capture dialog first (not RECORD_AUDIO).
+                    launchMediaProjectionDialog()
                 }
                 "stopCapture" -> {
                     stopCapture()
@@ -120,7 +136,6 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        // Audio ASR only
         EventChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "com.keyword/asr_stream",
@@ -137,7 +152,6 @@ class MainActivity : FlutterActivity() {
             }
         })
 
-        // Screen OCR only (independent of ASR)
         EventChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "com.keyword/ocr_stream",
@@ -168,6 +182,16 @@ class MainActivity : FlutterActivity() {
         })
     }
 
+    private fun truthy(v: Any?, defaultTrue: Boolean = false): Boolean {
+        return when (v) {
+            null -> defaultTrue
+            is Boolean -> v
+            is Number -> v.toInt() != 0
+            is String -> v.equals("true", ignoreCase = true) || v == "1"
+            else -> defaultTrue
+        }
+    }
+
     private fun wireOcrCallback() {
         CaptureForegroundService.onOcrText = { text ->
             mainHandler.post {
@@ -185,28 +209,21 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun requestCapturePermissionOrStart() {
-        // RECORD_AUDIO only when audio path is requested.
-        if (pendingAudioEnabled &&
-            checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            AppLog.w("Requesting RECORD_AUDIO permission (audio path)")
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1002)
+    /** System 「开始录制/投射」 dialog — always first step. */
+    private fun launchMediaProjectionDialog() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || projectionManager == null) {
+            AppLog.e("MediaProjection unavailable API=${Build.VERSION.SDK_INT}")
+            finishStart(ok = false, mode = "none", error = "no_media_projection")
             return
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && projectionManager != null) {
-            try {
-                startActivityForResult(
-                    projectionManager!!.createScreenCaptureIntent(),
-                    REQ_MEDIA_PROJECTION,
-                )
-                return
-            } catch (e: Exception) {
-                AppLog.w("MediaProjection intent failed", e)
-            }
+        try {
+            val intent = projectionManager!!.createScreenCaptureIntent()
+            AppLog.i("startActivityForResult createScreenCaptureIntent")
+            startActivityForResult(intent, REQ_MEDIA_PROJECTION)
+        } catch (e: Exception) {
+            AppLog.e("createScreenCaptureIntent failed", e)
+            finishStart(ok = false, mode = "none", error = "projection_intent_failed")
         }
-        finishStart(ok = false, mode = "none", error = "no_media_projection")
     }
 
     override fun onRequestPermissionsResult(
@@ -215,17 +232,19 @@ class MainActivity : FlutterActivity() {
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode != 1002) return
-        if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            AppLog.i("RECORD_AUDIO granted")
-            requestCapturePermissionOrStart()
+        if (requestCode != REQ_RECORD_AUDIO) return
+        val granted = grantResults.isNotEmpty() &&
+            grantResults[0] == PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            AppLog.i("RECORD_AUDIO granted — start service with audio")
+            startServiceWithPendingProjection()
         } else if (pendingOcrEnabled) {
-            // Audio denied but OCR still possible
-            AppLog.w("RECORD_AUDIO denied — continue with OCR only")
+            AppLog.w("RECORD_AUDIO denied — OCR-only service start")
             pendingAudioEnabled = false
-            requestCapturePermissionOrStart()
+            startServiceWithPendingProjection()
         } else {
-            AppLog.e("RECORD_AUDIO denied and OCR disabled")
+            AppLog.e("RECORD_AUDIO denied and OCR off")
+            pendingProjectionData = null
             finishStart(ok = false, mode = "none", error = "record_audio_denied")
         }
     }
@@ -235,15 +254,44 @@ class MainActivity : FlutterActivity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != REQ_MEDIA_PROJECTION) return
 
+        AppLog.i("MediaProjection resultCode=$resultCode dataNull=${data == null}")
         if (resultCode != Activity.RESULT_OK || data == null) {
             AppLog.e("MediaProjection denied by user")
             finishStart(ok = false, mode = "none", error = "projection_denied")
             return
         }
 
+        pendingProjectionResultCode = resultCode
+        pendingProjectionData = data
+
+        // After screen consent: request mic only if audio path wanted.
+        if (pendingAudioEnabled &&
+            checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            AppLog.w("Screen capture OK — now request RECORD_AUDIO for audio path")
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_RECORD_AUDIO)
+            return
+        }
+
+        startServiceWithPendingProjection()
+    }
+
+    private fun startServiceWithPendingProjection() {
+        val data = pendingProjectionData
+        val code = pendingProjectionResultCode
+        if (data == null || code == 0) {
+            AppLog.e("No pending MediaProjection data")
+            finishStart(ok = false, mode = "none", error = "projection_missing")
+            return
+        }
+        AppLog.i(
+            "startForegroundService capture ocr=$pendingOcrEnabled audio=$pendingAudioEnabled",
+        )
+        handledProjection.set(false)
         CaptureForegroundService.startWithProjection(
             this,
-            resultCode,
+            code,
             data,
             enableOcr = pendingOcrEnabled,
             enableAudio = pendingAudioEnabled,
@@ -301,8 +349,16 @@ class MainActivity : FlutterActivity() {
             "ocr" to (mode == "ocr" || mode.startsWith("ocr")),
             "audio" to (mode.contains("playback") || mode.contains("remote_submix")),
         )
-        pendingStartResult?.success(map)
+        try {
+            pendingStartResult?.success(map)
+        } catch (e: Exception) {
+            AppLog.w("finishStart result already used: $e")
+        }
         pendingStartResult = null
+        if (!ok) {
+            pendingProjectionData = null
+            pendingProjectionResultCode = 0
+        }
     }
 
     private fun stopCapture() {
@@ -311,6 +367,8 @@ class MainActivity : FlutterActivity() {
         asrStreamHandler?.stop()
         asrStreamHandler = null
         audioCapture = null
+        pendingProjectionData = null
+        pendingProjectionResultCode = 0
         CaptureForegroundService.onOcrText = null
         CaptureForegroundService.clearProjection()
         CaptureForegroundService.stop(this)

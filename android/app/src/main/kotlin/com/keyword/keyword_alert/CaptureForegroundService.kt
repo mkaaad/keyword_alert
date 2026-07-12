@@ -151,17 +151,25 @@ class CaptureForegroundService : Service() {
         val hasProjectionExtras = intent?.hasExtra(EXTRA_RESULT_CODE) == true &&
             intent.hasExtra(EXTRA_RESULT_DATA)
 
-        promoteToForeground(withMediaProjectionType = hasProjectionExtras)
+        // Read flags BEFORE startForeground — OCR-only must not claim microphone FGS
+        // (targetSDK 35 SecurityException without RECORD_AUDIO / CAPTURE_AUDIO_OUTPUT).
+        val enableOcr = intent?.getBooleanExtra(EXTRA_OCR_ENABLED, false) == true
+        val enableAudio = intent?.getBooleanExtra(EXTRA_AUDIO_ENABLED, true) != false
+        ocrEnabled = enableOcr
+        audioEnabled = enableAudio
+
+        promoteToForeground(
+            withMediaProjectionType = hasProjectionExtras,
+            withMicrophoneType = enableAudio && hasProjectionExtras,
+            enableOcr = enableOcr,
+            enableAudio = enableAudio,
+        )
 
         if (!hasProjectionExtras || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             return START_STICKY
         }
 
         val resultCode = intent!!.getIntExtra(EXTRA_RESULT_CODE, 0)
-        val enableOcr = intent.getBooleanExtra(EXTRA_OCR_ENABLED, false)
-        val enableAudio = intent.getBooleanExtra(EXTRA_AUDIO_ENABLED, true)
-        ocrEnabled = enableOcr
-        audioEnabled = enableAudio
         val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
         } else {
@@ -216,32 +224,17 @@ class CaptureForegroundService : Service() {
 
                 val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3)
                 imageReader = reader
-                virtualDisplay = try {
-                    // Prefer PUBLIC|AUTO_MIRROR — better frame delivery on some OEMs.
-                    projection.createVirtualDisplay(
-                        "keyword_alert_cap",
-                        width,
-                        height,
-                        density,
-                        DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or
-                            DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
-                        reader.surface,
-                        null,
-                        mainLooper,
-                    )
-                } catch (e: Exception) {
-                    AppLog.w("VD PUBLIC failed, fallback AUTO_MIRROR: $e")
-                    projection.createVirtualDisplay(
-                        "keyword_alert_cap",
-                        width,
-                        height,
-                        density,
-                        DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                        reader.surface,
-                        null,
-                        mainLooper,
-                    )
-                }
+                // MediaProjection: AUTO_MIRROR only (PUBLIC often black/empty on ColorOS).
+                virtualDisplay = projection.createVirtualDisplay(
+                    "keyword_alert_cap",
+                    width,
+                    height,
+                    density,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    reader.surface,
+                    null,
+                    mainLooper,
+                )
                 currentProjection = projection
                 AppLog.i("VirtualDisplay OK — starting independent paths")
 
@@ -379,11 +372,23 @@ class CaptureForegroundService : Service() {
         )
     }
 
-    private fun promoteToForeground(withMediaProjectionType: Boolean) {
+    private fun promoteToForeground(
+        withMediaProjectionType: Boolean,
+        withMicrophoneType: Boolean,
+        enableOcr: Boolean,
+        enableAudio: Boolean,
+    ) {
         val launch = packageManager.getLaunchIntentForPackage(packageName)
         val piFlags = PendingIntent.FLAG_UPDATE_CURRENT or
             (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
         val pi = PendingIntent.getActivity(this, 0, launch, piFlags)
+
+        val status = when {
+            enableOcr && enableAudio -> "OCR + 内录运行中…"
+            enableOcr -> "全屏 OCR 运行中…"
+            enableAudio -> "系统内录运行中…"
+            else -> "监控服务运行中…"
+        }
 
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
@@ -393,41 +398,54 @@ class CaptureForegroundService : Service() {
         }
         val notification = builder
             .setContentTitle("关键词监控")
-            .setContentText(
-                if (withMediaProjectionType) "全屏 OCR + 内录运行中…" else "监控服务运行中…",
-            )
+            .setContentText(if (withMediaProjectionType) status else "监控服务运行中…")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(pi)
             .setOngoing(true)
             .build()
 
+        // targetSDK 35: microphone FGS type REQUIRES RECORD_AUDIO (or CAPTURE_AUDIO_*).
+        // OCR-only must use mediaProjection alone — never microphone.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && withMediaProjectionType) {
             var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (withMicrophoneType && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             }
             try {
                 startForeground(NOTIF_ID, notification, type)
-                AppLog.i("startForeground mediaProjection|microphone OK")
-                return
-            } catch (e: Exception) {
-                AppLog.e("startForeground MEDIA_PROJECTION failed", e)
-            }
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            try {
-                startForeground(
-                    NOTIF_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+                AppLog.i(
+                    "startForeground OK type=$type " +
+                        "(mp=${type and ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION != 0} " +
+                        "mic=${type and ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE != 0})",
                 )
                 return
             } catch (e: Exception) {
-                AppLog.w("startForeground microphone failed", e)
+                AppLog.e("startForeground typed failed type=$type", e)
+                // OCR-only retry: projection only
+                if (withMicrophoneType) {
+                    try {
+                        startForeground(
+                            NOTIF_ID,
+                            notification,
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
+                        )
+                        AppLog.i("startForeground fallback mediaProjection-only OK")
+                        return
+                    } catch (e2: Exception) {
+                        AppLog.e("startForeground mediaProjection-only failed", e2)
+                    }
+                }
             }
         }
-        startForeground(NOTIF_ID, notification)
+
+        // Last resort (may still throw on API 34+ if FGS type required)
+        try {
+            startForeground(NOTIF_ID, notification)
+            AppLog.i("startForeground plain OK")
+        } catch (e: Exception) {
+            AppLog.e("startForeground plain failed", e)
+            throw e
+        }
     }
 
     override fun onDestroy() {
