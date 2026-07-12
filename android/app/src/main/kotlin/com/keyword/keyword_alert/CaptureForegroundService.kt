@@ -18,12 +18,14 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.util.Log
+import android.util.DisplayMetrics
+import android.view.WindowManager
 
 /**
  * After the user accepts screen capture, this service:
  * 1) startForeground(MEDIA_PROJECTION)
- * 2) getMediaProjection + VirtualDisplay (keeps session alive)
+ * 2) getMediaProjection + full-screen VirtualDisplay
+ * 3) Screen OCR (whole screen) + optional system audio capture
  *
  * Never start this service before the consent dialog — that crashes on API 34/ColorOS.
  */
@@ -34,6 +36,7 @@ class CaptureForegroundService : Service() {
         const val NOTIF_ID = 10042
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
+        const val EXTRA_OCR_ENABLED = "ocr_enabled"
 
         @Volatile
         var currentProjection: MediaProjection? = null
@@ -43,20 +46,41 @@ class CaptureForegroundService : Service() {
         var ready: Boolean = false
             private set
 
-        /** Shared playback capture started in this service (main thread). */
+        /** Combined mode: ocr | playback | remote_submix | ocr+… */
+        @Volatile
+        var captureMode: String = "none"
+            private set
+
+        @Volatile
+        var ocrEnabled: Boolean = false
+            private set
+
         @Volatile
         var audioCapture: AudioCapture? = null
             private set
+
+        @Volatile
+        var screenOcr: ScreenOcr? = null
+            private set
+
+        /** Flutter / MainActivity listens for OCR lines. */
+        @Volatile
+        var onOcrText: ((String) -> Unit)? = null
 
         private var virtualDisplay: VirtualDisplay? = null
         private var imageReader: ImageReader? = null
         private var projectionCallback: MediaProjection.Callback? = null
 
-        fun startWithProjection(context: Context, resultCode: Int, data: Intent) {
+        fun startWithProjection(
+            context: Context,
+            resultCode: Int,
+            data: Intent,
+            enableOcr: Boolean = false,
+        ) {
             val intent = Intent(context, CaptureForegroundService::class.java).apply {
                 putExtra(EXTRA_RESULT_CODE, resultCode)
-                // Intent is Parcelable; copy to survive process/service start
                 putExtra(EXTRA_RESULT_DATA, data)
+                putExtra(EXTRA_OCR_ENABLED, enableOcr)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
@@ -70,6 +94,11 @@ class CaptureForegroundService : Service() {
         }
 
         fun clearProjection() {
+            try {
+                screenOcr?.stop()
+            } catch (_: Exception) {
+            }
+            screenOcr = null
             try {
                 audioCapture?.stop()
             } catch (_: Exception) {
@@ -99,6 +128,7 @@ class CaptureForegroundService : Service() {
             } catch (_: Exception) {
             }
             currentProjection = null
+            captureMode = "none"
             ready = false
         }
     }
@@ -114,7 +144,6 @@ class CaptureForegroundService : Service() {
         val hasProjectionExtras = intent?.hasExtra(EXTRA_RESULT_CODE) == true &&
             intent.hasExtra(EXTRA_RESULT_DATA)
 
-        // Always enter foreground immediately (startForegroundService deadline).
         promoteToForeground(withMediaProjectionType = hasProjectionExtras)
 
         if (!hasProjectionExtras || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
@@ -122,6 +151,8 @@ class CaptureForegroundService : Service() {
         }
 
         val resultCode = intent!!.getIntExtra(EXTRA_RESULT_CODE, 0)
+        val enableOcr = intent.getBooleanExtra(EXTRA_OCR_ENABLED, false)
+        ocrEnabled = enableOcr
         val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
         } else {
@@ -136,18 +167,15 @@ class CaptureForegroundService : Service() {
             return START_STICKY
         }
 
-        // getMediaProjection must run after startForeground(MEDIA_PROJECTION).
-        // Post to main looper — some OEMs require main thread.
         val mainLooper = Handler(Looper.getMainLooper())
         mainLooper.post {
             try {
                 val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                 clearProjection()
+                ocrEnabled = enableOcr
                 val projection = mgr.getMediaProjection(resultCode, data)
                     ?: throw IllegalStateException("getMediaProjection returned null")
 
-                // API 34+: must registerCallback BEFORE createVirtualDisplay / audio capture,
-                // else IllegalStateException: Must register a callback before starting capture
                 val cb = object : MediaProjection.Callback() {
                     override fun onStop() {
                         AppLog.w("MediaProjection.onStop — user revoked or session ended")
@@ -157,48 +185,77 @@ class CaptureForegroundService : Service() {
                 }
                 projection.registerCallback(cb, mainLooper)
                 projectionCallback = cb
-                AppLog.i("MediaProjection.registerCallback OK")
+                AppLog.i("MediaProjection.registerCallback OK ocrEnabled=$enableOcr")
 
-                // Real Surface required on many devices (null surface → silent/broken capture).
-                val reader = ImageReader.newInstance(2, 2, PixelFormat.RGBA_8888, 2)
+                // OCR on: full-screen frames. OCR off: 2×2 surface only keeps session for audio.
+                val (width, height, density) = if (enableOcr) {
+                    screenSize()
+                } else {
+                    Triple(2, 2, resources.displayMetrics.densityDpi.coerceAtLeast(160))
+                }
+                AppLog.i("VirtualDisplay ${width}x${height} dpi=$density ocr=$enableOcr")
+
+                val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
                 imageReader = reader
                 virtualDisplay = projection.createVirtualDisplay(
                     "keyword_alert_cap",
-                    2,
-                    2,
-                    resources.displayMetrics.densityDpi.coerceAtLeast(160),
+                    width,
+                    height,
+                    density,
                     DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                     reader.surface,
                     null,
                     null,
                 )
                 currentProjection = projection
-                AppLog.i("VirtualDisplay OK — starting capture (playback + optional REMOTE_SUBMIX)")
+                AppLog.i("VirtualDisplay OK — starting capture paths")
 
-                // Build AudioRecord HERE on main thread with Service context.
-                // Creating it later on a worker thread / without Context often fails with:
-                // "Error: could not register audio policy" on Android 14/OEM.
-                // Brief settle so AudioFlinger sees an active projection session.
                 mainLooper.postDelayed({
                     if (currentProjection !== projection) {
-                        AppLog.w("Projection changed before audio start — abort")
+                        AppLog.w("Projection changed before capture start — abort")
                         return@postDelayed
                     }
+
+                    var ocrOk = false
+                    if (enableOcr) {
+                        val ocr = ScreenOcr { text ->
+                            onOcrText?.invoke(text)
+                        }
+                        ocrOk = ocr.start(reader)
+                        if (ocrOk) {
+                            screenOcr = ocr
+                        } else {
+                            AppLog.e("ScreenOcr failed to start")
+                        }
+                    } else {
+                        AppLog.i("ScreenOcr skipped (user disabled)")
+                    }
+
+                    var audioMode = "none"
                     val capture = AudioCapture()
                     val audioOk = capture.startPlaybackOnly(this@CaptureForegroundService, projection)
-                    if (!audioOk) {
-                        AppLog.e("All capture paths failed (playback + remote_submix)")
+                    if (audioOk) {
+                        audioCapture = capture
+                        audioMode = capture.captureMode
+                    } else {
+                        AppLog.w("Audio capture unavailable")
+                    }
+
+                    if (!ocrOk && !audioOk) {
+                        AppLog.e("No capture path (ocr=$enableOcr failed, audio failed)")
                         clearProjection()
                         ready = false
                         broadcastReady(false)
                         return@postDelayed
                     }
-                    audioCapture = capture
+
+                    captureMode = when {
+                        ocrOk && audioOk -> "ocr+$audioMode"
+                        ocrOk -> "ocr"
+                        else -> audioMode
+                    }
                     ready = true
-                    AppLog.i(
-                        "CaptureForegroundService: ready mode=${capture.captureMode} " +
-                            "(remote_submix better for 腾讯会议 VoIP)",
-                    )
+                    AppLog.i("CaptureForegroundService ready mode=$captureMode")
                     broadcastReady(true)
                 }, 150)
             } catch (e: Exception) {
@@ -212,10 +269,49 @@ class CaptureForegroundService : Service() {
         return START_STICKY
     }
 
+    private fun screenSize(): Triple<Int, Int, Int> {
+        val metrics = DisplayMetrics()
+        try {
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val bounds = wm.currentWindowMetrics.bounds
+                val density = resources.displayMetrics.densityDpi.coerceAtLeast(160)
+                // Cap extreme resolutions to limit ImageReader memory (~ARGB).
+                val maxEdge = 1920
+                var w = bounds.width().coerceAtLeast(2)
+                var h = bounds.height().coerceAtLeast(2)
+                val edge = maxOf(w, h)
+                if (edge > maxEdge) {
+                    val s = maxEdge.toFloat() / edge
+                    w = (w * s).toInt().coerceAtLeast(2)
+                    h = (h * s).toInt().coerceAtLeast(2)
+                }
+                return Triple(w, h, density)
+            }
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(metrics)
+        } catch (e: Exception) {
+            AppLog.w("screenSize fallback: $e")
+            metrics.setTo(resources.displayMetrics)
+        }
+        val density = metrics.densityDpi.coerceAtLeast(160)
+        var w = metrics.widthPixels.coerceAtLeast(2)
+        var h = metrics.heightPixels.coerceAtLeast(2)
+        val maxEdge = 1920
+        val edge = maxOf(w, h)
+        if (edge > maxEdge) {
+            val s = maxEdge.toFloat() / edge
+            w = (w * s).toInt().coerceAtLeast(2)
+            h = (h * s).toInt().coerceAtLeast(2)
+        }
+        return Triple(w, h, density)
+    }
+
     private fun broadcastReady(ok: Boolean) {
         sendBroadcast(
             Intent(ACTION_PROJECTION_READY).setPackage(packageName).apply {
                 putExtra(EXTRA_OK, ok)
+                putExtra("mode", captureMode)
             },
         )
     }
@@ -229,7 +325,7 @@ class CaptureForegroundService : Service() {
                 "关键词监控采集",
                 NotificationManager.IMPORTANCE_LOW,
             ).apply {
-                description = "系统音频捕获运行中"
+                description = "全屏录屏 OCR + 系统音频捕获"
                 setShowBadge(false)
             },
         )
@@ -249,7 +345,9 @@ class CaptureForegroundService : Service() {
         }
         val notification = builder
             .setContentTitle("关键词监控")
-            .setContentText(if (withMediaProjectionType) "系统内录运行中…" else "监控服务运行中…")
+            .setContentText(
+                if (withMediaProjectionType) "全屏 OCR + 内录运行中…" else "监控服务运行中…",
+            )
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(pi)
             .setOngoing(true)
@@ -266,7 +364,6 @@ class CaptureForegroundService : Service() {
                 return
             } catch (e: Exception) {
                 AppLog.e("startForeground MEDIA_PROJECTION failed", e)
-                // Fall through — may still try plain (getMediaProjection will fail without type)
             }
         }
 

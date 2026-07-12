@@ -47,6 +47,8 @@ android {
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
     implementation("com.xdcobra.sherpa:sherpa-onnx:1.13.2-1")
+    // Full-screen MediaProjection → Chinese OCR (腾讯会议字幕/聊天)
+    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
 }
 
 repositories {

@@ -25,8 +25,10 @@ class _HomePageState extends State<HomePage> {
   KeywordMonitor? _monitor;
   bool _isMonitoring = false;
   bool _isStarting = false;
+  /// Full-screen MediaProjection OCR (user toggle, persisted).
+  bool _ocrEnabled = false;
   String _lastText = '等待识别...';
-  String _captureMode = 'none'; // playback | none
+  String _captureMode = 'none'; // playback | ocr | ocr+playback | ...
   int _hitCount = 0;
   final List<String> _recentTexts = [];
   final List<String> _debugLogs = [];
@@ -105,8 +107,10 @@ class _HomePageState extends State<HomePage> {
       final keyword = prefs.getString('keyword') ?? '老师';
       final threshold = prefs.getInt('threshold') ?? 3;
       final windowSeconds = prefs.getInt('windowSeconds') ?? 60;
+      final ocrEnabled = prefs.getBool('ocr_enabled') ?? false;
       if (!mounted) return;
       setState(() {
+        _ocrEnabled = ocrEnabled;
         _config = MonitorConfig(
           keyword: keyword,
           threshold: threshold.clamp(1, 100),
@@ -118,6 +122,17 @@ class _HomePageState extends State<HomePage> {
       debugPrint('Load config failed: $e');
       if (!mounted) return;
       setState(_createMonitor);
+    }
+  }
+
+  Future<void> _setOcrEnabled(bool value) async {
+    setState(() => _ocrEnabled = value);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('ocr_enabled', value);
+      _appendLog('录屏识字 OCR=${value ? "开" : "关"}（下次开始监控生效）');
+    } catch (e) {
+      debugPrint('Save ocr_enabled failed: $e');
     }
   }
 
@@ -154,10 +169,12 @@ class _HomePageState extends State<HomePage> {
     }
 
     setState(() => _isStarting = true);
-    _appendLog('开始监控…（将请求屏幕录制/投射）');
+    _appendLog(
+      '开始监控… ocr=${_ocrEnabled ? "开" : "关"}（请求屏幕录制/投射）',
+    );
 
-    // Native: dialog first → mediaProjection FGS → AudioPlaybackCapture only (no mic).
-    final start = await _audioCapture.start();
+    // Native: consent → FGS → audio (+ optional full-screen OCR). No mic fallback.
+    final start = await _audioCapture.start(ocrEnabled: _ocrEnabled);
     _appendLog('start 结果 ok=${start.ok} mode=${start.mode} err=${start.error}');
     if (!start.ok || !start.isPlayback) {
       if (mounted) {
@@ -169,15 +186,16 @@ class _HomePageState extends State<HomePage> {
         await showDialog<void>(
           context: context,
           builder: (ctx) => AlertDialog(
-            title: const Text('系统内录未成功'),
+            title: const Text('采集未成功'),
             content: Text(
-              '未能捕获其它 App 的播放声音（不会静默改用麦克风）。\n\n'
-              '错误码: $err\n\n'
+              '未能启动系统内录和/或录屏识字。\n\n'
+              '错误码: $err\n'
+              'OCR 开关: ${_ocrEnabled ? "开" : "关"}\n\n'
               '请确认：\n'
               '1. 点了「立即开始」允许屏幕录制/投射\n'
               '2. 通知栏允许本应用前台服务\n'
-              '3. 腾讯会议等走「通话/VoIP」音，请用 Magisk 模块安装（REMOTE_SUBMIX）\n'
-              '4. 看下方「运行日志」：mode=remote_submix 或 playback，以及 RMS',
+              '3. 腾讯会议：建议打开「录屏识字」；音频可装 Magisk\n'
+              '4. 看运行日志 mode / OCR text / RMS',
             ),
             actions: [
               FilledButton(
@@ -196,15 +214,19 @@ class _HomePageState extends State<HomePage> {
     _audioCapture.listen(
       (text) {
         if (!mounted) return;
+        // OCR lines are prefixed "[OCR] "; strip for keyword match, keep for UI.
+        final feedText = text.startsWith('[OCR] ')
+            ? text.substring(6)
+            : text;
         setState(() {
           _lastText = text;
           _recentTexts.insert(0, text);
           if (_recentTexts.length > 50) _recentTexts.removeLast();
         });
-        _monitor?.feed(text);
+        _monitor?.feed(feedText);
       },
       onError: (e) {
-        debugPrint('ASR error: $e');
+        debugPrint('ASR/OCR error: $e');
         if (mounted) {
           setState(() => _lastText = '识别出错: $e');
         }
@@ -212,9 +234,10 @@ class _HomePageState extends State<HomePage> {
     );
 
     try {
+      final modeHint = start.hasOcr ? 'OCR+内录' : '系统内录';
       await FlutterForegroundTask.startService(
         notificationTitle: '关键词监控运行中',
-        notificationText: '系统内录 · 监听「${_config.keyword}」',
+        notificationText: '$modeHint · 监听「${_config.keyword}」',
         callback: backgroundTaskCallback,
       );
     } catch (e) {
@@ -228,7 +251,9 @@ class _HomePageState extends State<HomePage> {
       _captureMode = start.mode;
       _hitCount = 0;
       _recentTexts.clear();
-      _lastText = '等待识别...（系统内录）';
+      _lastText = start.hasOcr
+          ? '等待识别...（全屏 OCR + 内录）'
+          : '等待识别...（系统内录）';
     });
   }
 
@@ -345,9 +370,12 @@ class _HomePageState extends State<HomePage> {
                       children: [
                         Text(
                           _isMonitoring
-                              ? (_captureMode == 'playback'
-                                  ? '🟢 系统内录'
-                                  : '🟡 监控中·$_captureMode')
+                              ? (_captureMode.contains('ocr')
+                                  ? '🟢 $_captureMode'
+                                  : _captureMode == 'playback' ||
+                                          _captureMode == 'remote_submix'
+                                      ? '🟢 $_captureMode'
+                                      : '🟡 监控中·$_captureMode')
                               : '⚪ 已停止',
                           style: theme.textTheme.titleMedium,
                         ),
@@ -371,6 +399,28 @@ class _HomePageState extends State<HomePage> {
                     ),
                   ],
                 ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Card(
+              child: SwitchListTile(
+                contentPadding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 0),
+                secondary: Icon(
+                  Icons.document_scanner_outlined,
+                  color: _ocrEnabled ? Colors.deepOrange : null,
+                ),
+                title: const Text('录屏识字（全屏 OCR）'),
+                subtitle: Text(
+                  _ocrEnabled
+                      ? '开启后截取整屏识别中文（字幕/聊天），约 1.5 秒一次'
+                      : '关闭时仅系统内录音频；会议建议打开',
+                  style: theme.textTheme.bodySmall,
+                ),
+                value: _ocrEnabled,
+                onChanged: _isMonitoring || _isStarting
+                    ? null
+                    : (v) => unawaited(_setOcrEnabled(v)),
               ),
             ),
             const SizedBox(height: 8),

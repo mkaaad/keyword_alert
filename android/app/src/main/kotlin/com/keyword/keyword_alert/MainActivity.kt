@@ -35,6 +35,8 @@ class MainActivity : FlutterActivity() {
     private var projectionManager: MediaProjectionManager? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val handledProjection = AtomicBoolean(false)
+    /** From Flutter startCapture args — full-screen OCR when true. */
+    private var pendingOcrEnabled: Boolean = false
 
     private val projectionReadyReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -79,14 +81,21 @@ class MainActivity : FlutterActivity() {
                     }
                     pendingStartResult = result
                     handledProjection.set(false)
+                    val args = call.arguments as? Map<*, *>
+                    pendingOcrEnabled = args?.get("ocrEnabled") == true
+                    AppLog.i("startCapture ocrEnabled=$pendingOcrEnabled")
                     requestCapturePermissionOrStart()
                 }
                 "stopCapture" -> {
                     stopCapture()
                     result.success(true)
                 }
-                "isActive" -> result.success(audioCapture?.isActive() ?: false)
-                "captureMode" -> result.success(audioCapture?.captureMode ?: "none")
+                "isActive" -> {
+                    val audio = CaptureForegroundService.audioCapture?.isActive() == true
+                    val ocr = CaptureForegroundService.screenOcr?.isActive == true
+                    result.success(audio || ocr)
+                }
+                "captureMode" -> result.success(CaptureForegroundService.captureMode)
                 else -> result.notImplemented()
             }
         }
@@ -117,10 +126,19 @@ class MainActivity : FlutterActivity() {
             override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
                 eventSink = events
                 asrStreamHandler?.setSink(events)
+                CaptureForegroundService.onOcrText = { text ->
+                    mainHandler.post {
+                        try {
+                            eventSink?.success("[OCR] $text")
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
             }
 
             override fun onCancel(arguments: Any?) {
                 asrStreamHandler?.setSink(null)
+                CaptureForegroundService.onOcrText = null
                 eventSink = null
             }
         })
@@ -193,7 +211,12 @@ class MainActivity : FlutterActivity() {
         }
 
         // User accepted → start FGS + getMediaProjection inside service (API 34 order).
-        CaptureForegroundService.startWithProjection(this, resultCode, data)
+        CaptureForegroundService.startWithProjection(
+            this,
+            resultCode,
+            data,
+            enableOcr = pendingOcrEnabled,
+        )
         mainHandler.postDelayed(projectionTimeout, PROJECTION_WAIT_MS)
     }
 
@@ -204,28 +227,48 @@ class MainActivity : FlutterActivity() {
         }
         mainHandler.removeCallbacks(projectionTimeout)
 
-        val capture = CaptureForegroundService.audioCapture
         val projection = CaptureForegroundService.currentProjection
-        if (!projectionOk || capture == null || projection == null || !capture.isActive()) {
+        val capture = CaptureForegroundService.audioCapture
+        val ocr = CaptureForegroundService.screenOcr
+        val mode = CaptureForegroundService.captureMode
+        val audioOk = capture != null && capture.isActive()
+        val ocrOk = ocr != null && ocr.isActive
+
+        if (!projectionOk || projection == null || (!audioOk && !ocrOk)) {
             AppLog.e(
-                "Projection/audio not ready ok=$projectionOk capture=${capture != null} " +
-                    "projection=${projection != null} active=${capture?.isActive()}",
+                "Capture not ready ok=$projectionOk projection=${projection != null} " +
+                    "audio=$audioOk ocr=$ocrOk mode=$mode",
             )
-            finishStart(ok = false, mode = "none", error = "playback_capture_failed")
+            finishStart(ok = false, mode = "none", error = "capture_failed")
             return
         }
 
-        // AudioRecord already running inside CaptureForegroundService (main thread).
-        // Do not stop() that capture instance — only reattach ASR.
+        // Wire OCR → Flutter (also set in EventChannel onListen)
+        CaptureForegroundService.onOcrText = { text ->
+            mainHandler.post {
+                try {
+                    eventSink?.success("[OCR] $text")
+                } catch (_: Exception) {
+                }
+            }
+        }
+
+        // ASR only when system audio path is running.
         asrStreamHandler?.stop()
         asrStreamHandler = null
         audioCapture = capture
-        val handler = AsrStreamHandler(capture, this@MainActivity)
-        asrStreamHandler = handler
-        handler.setSink(eventSink)
-        handler.start()
-        AppLog.i("AudioCapture attached mode=${capture.captureMode} (no mic)")
-        finishStart(ok = true, mode = capture.captureMode, error = null)
+        if (audioOk && capture != null) {
+            val handler = AsrStreamHandler(capture, this@MainActivity)
+            asrStreamHandler = handler
+            handler.setSink(eventSink)
+            handler.start()
+            AppLog.i("ASR attached mode=${capture.captureMode}")
+        } else {
+            AppLog.i("ASR skipped — OCR-only mode")
+        }
+
+        AppLog.i("Capture ready mode=$mode audio=$audioOk ocr=$ocrOk")
+        finishStart(ok = true, mode = mode, error = null)
     }
 
     private fun finishStart(ok: Boolean, mode: String, error: String?) {
@@ -243,7 +286,8 @@ class MainActivity : FlutterActivity() {
         mainHandler.removeCallbacks(projectionTimeout)
         asrStreamHandler?.stop()
         asrStreamHandler = null
-        audioCapture = null // owned by service; clearProjection() stops it
+        audioCapture = null
+        CaptureForegroundService.onOcrText = null
         CaptureForegroundService.clearProjection()
         CaptureForegroundService.stop(this)
     }

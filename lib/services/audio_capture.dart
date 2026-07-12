@@ -4,7 +4,7 @@ import 'package:flutter/services.dart';
 
 class CaptureStartResult {
   final bool ok;
-  final String mode; // playback | none | ...
+  final String mode; // playback | remote_submix | ocr | ocr+playback | ...
   final String? error;
 
   const CaptureStartResult({
@@ -13,11 +13,17 @@ class CaptureStartResult {
     this.error,
   });
 
-  /// True when any system-audio path is active (not mic).
-  bool get isPlayback =>
-      mode == 'playback' ||
-      mode == 'playback_voice' ||
-      mode == 'remote_submix';
+  /// True when any usable capture path is active (audio and/or screen OCR).
+  bool get isPlayback {
+    if (mode == 'none' || mode.isEmpty) return false;
+    return mode == 'playback' ||
+        mode == 'playback_voice' ||
+        mode == 'remote_submix' ||
+        mode == 'ocr' ||
+        mode.startsWith('ocr');
+  }
+
+  bool get hasOcr => mode == 'ocr' || mode.startsWith('ocr+') || mode.contains('ocr');
 }
 
 class AudioCaptureService {
@@ -28,9 +34,13 @@ class AudioCaptureService {
   StreamSubscription<String>? _subscription;
   StreamSubscription<String>? _logSubscription;
 
-  Future<CaptureStartResult> start() async {
+  /// [ocrEnabled] turns on full-screen MediaProjection OCR (ML Kit Chinese).
+  Future<CaptureStartResult> start({bool ocrEnabled = false}) async {
     try {
-      final raw = await _channel.invokeMethod<dynamic>('startCapture');
+      final raw = await _channel.invokeMethod<dynamic>(
+        'startCapture',
+        <String, dynamic>{'ocrEnabled': ocrEnabled},
+      );
       if (raw is Map) {
         return CaptureStartResult(
           ok: raw['ok'] == true,
@@ -83,6 +93,7 @@ class AudioCaptureService {
     return _logSubscription!;
   }
 
+  /// ASR and/or OCR text lines (OCR prefixed with `[OCR] `).
   StreamSubscription<String> listen(
     void Function(String text) onData, {
     void Function(Object error)? onError,
@@ -95,7 +106,7 @@ class AudioCaptureService {
         .listen(
       onData,
       onError: (Object e, StackTrace st) {
-        debugPrint('ASR stream error: $e');
+        debugPrint('ASR/OCR stream error: $e');
         onError?.call(e);
       },
       cancelOnError: false,
