@@ -37,6 +37,7 @@ class CaptureForegroundService : Service() {
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
         const val EXTRA_OCR_ENABLED = "ocr_enabled"
+        const val EXTRA_AUDIO_ENABLED = "audio_enabled"
 
         @Volatile
         var currentProjection: MediaProjection? = null
@@ -46,13 +47,17 @@ class CaptureForegroundService : Service() {
         var ready: Boolean = false
             private set
 
-        /** Combined mode: ocr | playback | remote_submix | ocr+… */
+        /** Modes: ocr | playback | remote_submix | ocr+playback | … */
         @Volatile
         var captureMode: String = "none"
             private set
 
         @Volatile
         var ocrEnabled: Boolean = false
+            private set
+
+        @Volatile
+        var audioEnabled: Boolean = true
             private set
 
         @Volatile
@@ -63,7 +68,7 @@ class CaptureForegroundService : Service() {
         var screenOcr: ScreenOcr? = null
             private set
 
-        /** Flutter / MainActivity listens for OCR lines. */
+        /** Flutter listens for OCR lines on a dedicated channel. */
         @Volatile
         var onOcrText: ((String) -> Unit)? = null
 
@@ -76,11 +81,13 @@ class CaptureForegroundService : Service() {
             resultCode: Int,
             data: Intent,
             enableOcr: Boolean = false,
+            enableAudio: Boolean = true,
         ) {
             val intent = Intent(context, CaptureForegroundService::class.java).apply {
                 putExtra(EXTRA_RESULT_CODE, resultCode)
                 putExtra(EXTRA_RESULT_DATA, data)
                 putExtra(EXTRA_OCR_ENABLED, enableOcr)
+                putExtra(EXTRA_AUDIO_ENABLED, enableAudio)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
@@ -152,7 +159,9 @@ class CaptureForegroundService : Service() {
 
         val resultCode = intent!!.getIntExtra(EXTRA_RESULT_CODE, 0)
         val enableOcr = intent.getBooleanExtra(EXTRA_OCR_ENABLED, false)
+        val enableAudio = intent.getBooleanExtra(EXTRA_AUDIO_ENABLED, true)
         ocrEnabled = enableOcr
+        audioEnabled = enableAudio
         val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
         } else {
@@ -167,12 +176,20 @@ class CaptureForegroundService : Service() {
             return START_STICKY
         }
 
+        if (!enableOcr && !enableAudio) {
+            AppLog.e("Both OCR and audio disabled")
+            ready = false
+            broadcastReady(false)
+            return START_STICKY
+        }
+
         val mainLooper = Handler(Looper.getMainLooper())
         mainLooper.post {
             try {
                 val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                 clearProjection()
                 ocrEnabled = enableOcr
+                audioEnabled = enableAudio
                 val projection = mgr.getMediaProjection(resultCode, data)
                     ?: throw IllegalStateException("getMediaProjection returned null")
 
@@ -185,9 +202,11 @@ class CaptureForegroundService : Service() {
                 }
                 projection.registerCallback(cb, mainLooper)
                 projectionCallback = cb
-                AppLog.i("MediaProjection.registerCallback OK ocrEnabled=$enableOcr")
+                AppLog.i(
+                    "MediaProjection.registerCallback OK ocr=$enableOcr audio=$enableAudio",
+                )
 
-                // OCR on: full-screen frames. OCR off: 2×2 surface only keeps session for audio.
+                // OCR needs full-screen frames; audio-only uses tiny VD to keep session.
                 val (width, height, density) = if (enableOcr) {
                     screenSize()
                 } else {
@@ -195,21 +214,38 @@ class CaptureForegroundService : Service() {
                 }
                 AppLog.i("VirtualDisplay ${width}x${height} dpi=$density ocr=$enableOcr")
 
-                val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+                val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3)
                 imageReader = reader
-                virtualDisplay = projection.createVirtualDisplay(
-                    "keyword_alert_cap",
-                    width,
-                    height,
-                    density,
-                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                    reader.surface,
-                    null,
-                    null,
-                )
+                virtualDisplay = try {
+                    // Prefer PUBLIC|AUTO_MIRROR — better frame delivery on some OEMs.
+                    projection.createVirtualDisplay(
+                        "keyword_alert_cap",
+                        width,
+                        height,
+                        density,
+                        DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or
+                            DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
+                        reader.surface,
+                        null,
+                        mainLooper,
+                    )
+                } catch (e: Exception) {
+                    AppLog.w("VD PUBLIC failed, fallback AUTO_MIRROR: $e")
+                    projection.createVirtualDisplay(
+                        "keyword_alert_cap",
+                        width,
+                        height,
+                        density,
+                        DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                        reader.surface,
+                        null,
+                        mainLooper,
+                    )
+                }
                 currentProjection = projection
-                AppLog.i("VirtualDisplay OK — starting capture paths")
+                AppLog.i("VirtualDisplay OK — starting independent paths")
 
+                // Give the mirror a moment to paint before starting OCR.
                 mainLooper.postDelayed({
                     if (currentProjection !== projection) {
                         AppLog.w("Projection changed before capture start — abort")
@@ -219,11 +255,17 @@ class CaptureForegroundService : Service() {
                     var ocrOk = false
                     if (enableOcr) {
                         val ocr = ScreenOcr { text ->
-                            onOcrText?.invoke(text)
+                            val cbText = onOcrText
+                            if (cbText == null) {
+                                AppLog.w("OCR text dropped — no Flutter listener yet: ${text.take(40)}")
+                            } else {
+                                cbText.invoke(text)
+                            }
                         }
                         ocrOk = ocr.start(reader)
                         if (ocrOk) {
                             screenOcr = ocr
+                            AppLog.i("ScreenOcr path active (independent of audio)")
                         } else {
                             AppLog.e("ScreenOcr failed to start")
                         }
@@ -232,17 +274,23 @@ class CaptureForegroundService : Service() {
                     }
 
                     var audioMode = "none"
-                    val capture = AudioCapture()
-                    val audioOk = capture.startPlaybackOnly(this@CaptureForegroundService, projection)
-                    if (audioOk) {
-                        audioCapture = capture
-                        audioMode = capture.captureMode
+                    var audioOk = false
+                    if (enableAudio) {
+                        val capture = AudioCapture()
+                        audioOk = capture.startPlaybackOnly(this@CaptureForegroundService, projection)
+                        if (audioOk) {
+                            audioCapture = capture
+                            audioMode = capture.captureMode
+                            AppLog.i("Audio path active mode=$audioMode")
+                        } else {
+                            AppLog.w("Audio capture unavailable")
+                        }
                     } else {
-                        AppLog.w("Audio capture unavailable")
+                        AppLog.i("Audio path skipped (user disabled)")
                     }
 
                     if (!ocrOk && !audioOk) {
-                        AppLog.e("No capture path (ocr=$enableOcr failed, audio failed)")
+                        AppLog.e("No capture path (ocr=$enableOcr/$ocrOk audio=$enableAudio/$audioOk)")
                         clearProjection()
                         ready = false
                         broadcastReady(false)
@@ -257,7 +305,7 @@ class CaptureForegroundService : Service() {
                     ready = true
                     AppLog.i("CaptureForegroundService ready mode=$captureMode")
                     broadcastReady(true)
-                }, 150)
+                }, 400)
             } catch (e: Exception) {
                 AppLog.e("getMediaProjection in service failed", e)
                 clearProjection()

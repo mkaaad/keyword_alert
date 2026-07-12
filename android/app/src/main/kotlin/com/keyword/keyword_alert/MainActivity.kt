@@ -2,17 +2,15 @@ package com.keyword.keyword_alert
 
 import android.Manifest
 import android.app.Activity
-import android.content.pm.PackageManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.media.projection.MediaProjection
+import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -21,22 +19,21 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : FlutterActivity() {
     companion object {
-        private const val TAG = "KeywordAlert"
         private const val REQ_MEDIA_PROJECTION = 1001
-        // Service settles VirtualDisplay + AudioRecord retries; allow extra time on slow OEMs.
-        private const val PROJECTION_WAIT_MS = 5000L
+        private const val PROJECTION_WAIT_MS = 6000L
     }
 
     private var audioCapture: AudioCapture? = null
     private var asrStreamHandler: AsrStreamHandler? = null
-    private var eventSink: EventChannel.EventSink? = null
+    private var asrSink: EventChannel.EventSink? = null
+    private var ocrSink: EventChannel.EventSink? = null
 
     private var pendingStartResult: MethodChannel.Result? = null
     private var projectionManager: MediaProjectionManager? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val handledProjection = AtomicBoolean(false)
-    /** From Flutter startCapture args — full-screen OCR when true. */
     private var pendingOcrEnabled: Boolean = false
+    private var pendingAudioEnabled: Boolean = true
 
     private val projectionReadyReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -71,7 +68,7 @@ class MainActivity : FlutterActivity() {
 
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
-            "com.keyword/audio_capture"
+            "com.keyword/audio_capture",
         ).setMethodCallHandler { call, result ->
             when (call.method) {
                 "startCapture" -> {
@@ -83,7 +80,15 @@ class MainActivity : FlutterActivity() {
                     handledProjection.set(false)
                     val args = call.arguments as? Map<*, *>
                     pendingOcrEnabled = args?.get("ocrEnabled") == true
-                    AppLog.i("startCapture ocrEnabled=$pendingOcrEnabled")
+                    // Default audio on unless explicitly false
+                    pendingAudioEnabled = args?.get("audioEnabled") != false
+                    if (!pendingOcrEnabled && !pendingAudioEnabled) {
+                        finishStart(ok = false, mode = "none", error = "nothing_enabled")
+                        return@setMethodCallHandler
+                    }
+                    AppLog.i(
+                        "startCapture ocr=$pendingOcrEnabled audio=$pendingAudioEnabled",
+                    )
                     requestCapturePermissionOrStart()
                 }
                 "stopCapture" -> {
@@ -100,16 +105,12 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        // System default alarm ringtone (TYPE_ALARM / USAGE_ALARM).
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "com.keyword/alarm",
         ).setMethodCallHandler { call, result ->
             when (call.method) {
-                "playSystemAlarm" -> {
-                    val ok = AlarmPlayer.play(this)
-                    result.success(ok)
-                }
+                "playSystemAlarm" -> result.success(AlarmPlayer.play(this))
                 "stopSystemAlarm" -> {
                     AlarmPlayer.stop()
                     result.success(true)
@@ -119,33 +120,42 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        // Audio ASR only
         EventChannel(
             flutterEngine.dartExecutor.binaryMessenger,
-            "com.keyword/asr_stream"
+            "com.keyword/asr_stream",
         ).setStreamHandler(object : EventChannel.StreamHandler {
             override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
-                eventSink = events
+                asrSink = events
                 asrStreamHandler?.setSink(events)
-                CaptureForegroundService.onOcrText = { text ->
-                    mainHandler.post {
-                        try {
-                            eventSink?.success("[OCR] $text")
-                        } catch (_: Exception) {
-                        }
-                    }
-                }
+                AppLog.i("asr_stream attached")
             }
 
             override fun onCancel(arguments: Any?) {
                 asrStreamHandler?.setSink(null)
-                CaptureForegroundService.onOcrText = null
-                eventSink = null
+                asrSink = null
+            }
+        })
+
+        // Screen OCR only (independent of ASR)
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "com.keyword/ocr_stream",
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                ocrSink = events
+                wireOcrCallback()
+                AppLog.i("ocr_stream attached")
+            }
+
+            override fun onCancel(arguments: Any?) {
+                ocrSink = null
             }
         })
 
         EventChannel(
             flutterEngine.dartExecutor.binaryMessenger,
-            "com.keyword/debug_log"
+            "com.keyword/debug_log",
         ).setStreamHandler(object : EventChannel.StreamHandler {
             override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
                 AppLog.setSink(events)
@@ -158,15 +168,33 @@ class MainActivity : FlutterActivity() {
         })
     }
 
+    private fun wireOcrCallback() {
+        CaptureForegroundService.onOcrText = { text ->
+            mainHandler.post {
+                try {
+                    val sink = ocrSink
+                    if (sink == null) {
+                        AppLog.w("OCR sink null, drop: ${text.take(40)}")
+                    } else {
+                        sink.success(text)
+                    }
+                } catch (e: Exception) {
+                    AppLog.w("OCR sink emit failed: $e")
+                }
+            }
+        }
+    }
+
     private fun requestCapturePermissionOrStart() {
-        // RECORD_AUDIO is still required for AudioPlaybackCapture on many devices.
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            AppLog.w("Requesting RECORD_AUDIO permission")
+        // RECORD_AUDIO only when audio path is requested.
+        if (pendingAudioEnabled &&
+            checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            AppLog.w("Requesting RECORD_AUDIO permission (audio path)")
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1002)
-            // Will continue after onRequestPermissionsResult — store pending already set
             return
         }
-        // Never start mediaProjection FGS before consent.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && projectionManager != null) {
             try {
                 startActivityForResult(
@@ -178,10 +206,8 @@ class MainActivity : FlutterActivity() {
                 AppLog.w("MediaProjection intent failed", e)
             }
         }
-        // No projection available (API < 29): do not pretend mic is OK for "system audio"
         finishStart(ok = false, mode = "none", error = "no_media_projection")
     }
-
 
     override fun onRequestPermissionsResult(
         requestCode: Int,
@@ -191,10 +217,15 @@ class MainActivity : FlutterActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode != 1002) return
         if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            AppLog.i("RECORD_AUDIO granted, opening MediaProjection dialog")
+            AppLog.i("RECORD_AUDIO granted")
+            requestCapturePermissionOrStart()
+        } else if (pendingOcrEnabled) {
+            // Audio denied but OCR still possible
+            AppLog.w("RECORD_AUDIO denied — continue with OCR only")
+            pendingAudioEnabled = false
             requestCapturePermissionOrStart()
         } else {
-            AppLog.e("RECORD_AUDIO denied")
+            AppLog.e("RECORD_AUDIO denied and OCR disabled")
             finishStart(ok = false, mode = "none", error = "record_audio_denied")
         }
     }
@@ -210,12 +241,12 @@ class MainActivity : FlutterActivity() {
             return
         }
 
-        // User accepted → start FGS + getMediaProjection inside service (API 34 order).
         CaptureForegroundService.startWithProjection(
             this,
             resultCode,
             data,
             enableOcr = pendingOcrEnabled,
+            enableAudio = pendingAudioEnabled,
         )
         mainHandler.postDelayed(projectionTimeout, PROJECTION_WAIT_MS)
     }
@@ -243,28 +274,19 @@ class MainActivity : FlutterActivity() {
             return
         }
 
-        // Wire OCR → Flutter (also set in EventChannel onListen)
-        CaptureForegroundService.onOcrText = { text ->
-            mainHandler.post {
-                try {
-                    eventSink?.success("[OCR] $text")
-                } catch (_: Exception) {
-                }
-            }
-        }
+        wireOcrCallback()
 
-        // ASR only when system audio path is running.
         asrStreamHandler?.stop()
         asrStreamHandler = null
         audioCapture = capture
         if (audioOk && capture != null) {
             val handler = AsrStreamHandler(capture, this@MainActivity)
             asrStreamHandler = handler
-            handler.setSink(eventSink)
+            handler.setSink(asrSink)
             handler.start()
             AppLog.i("ASR attached mode=${capture.captureMode}")
         } else {
-            AppLog.i("ASR skipped — OCR-only mode")
+            AppLog.i("ASR not started (audio path off or failed)")
         }
 
         AppLog.i("Capture ready mode=$mode audio=$audioOk ocr=$ocrOk")
@@ -276,6 +298,8 @@ class MainActivity : FlutterActivity() {
             "ok" to ok,
             "mode" to mode,
             "error" to error,
+            "ocr" to (mode == "ocr" || mode.startsWith("ocr")),
+            "audio" to (mode.contains("playback") || mode.contains("remote_submix")),
         )
         pendingStartResult?.success(map)
         pendingStartResult = null
